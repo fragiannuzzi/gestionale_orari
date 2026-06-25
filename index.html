@@ -291,16 +291,22 @@ textarea.form-control{resize:vertical;min-height:64px}
         </div>
       </div>
 
+      <div class="form-group mb-16" style="background:#F8F9FA;border:1px solid var(--border);border-radius:6px;padding:14px">
+        <label class="form-label">🚚 Giorni con arrivo camion (il dipendente camion inizia alle 07:00 e lavora almeno fino all'apertura)</label>
+        <div class="check-group mt-8" id="camionDaysGroup"></div>
+        <button class="btn btn-secondary btn-sm mt-8" onclick="saveCamionDays()">💾 Salva</button>
+      </div>
+
       <div class="info-box mb-16">
         <strong>Regole applicate automaticamente:</strong>
         <ul style="margin-top:6px;padding-left:18px;line-height:1.9;font-size:12px">
-          <li>Almeno 1 in <b>Cassa</b>, 1 in <b>Profumeria</b>, 1 in <b>Magazzino-Vendita</b> ogni giorno</li>
-          <li>La copertura non richiede tutta la giornata (ore pranzo possono essere scoperte)</li>
-          <li>1 giorno di riposo settimanale obbligatorio per dipendente</li>
-          <li>Max 8 ore lavorative al giorno — rispetto ore contrattuali settimanali</li>
+          <li>Tutte le aree coperte per tutta la giornata (mattina e pomeriggio) — eccezione: Magazzino-Vendita può restare scoperto</li>
+          <li>Possibile turno spezzato (mattina + pomeriggio) se necessario per la copertura</li>
+          <li>1 giorno di riposo settimanale per dipendente, a rotazione</li>
+          <li>Rispetto ore contrattuali settimanali — senza limite fisso giornaliero</li>
           <li>Specializzato profumeria → assegnato prioritariamente in Profumeria</li>
-          <li>Dipendente con camion → turno inizia alle 07:00</li>
-          <li>Periodi ferie dei dipendenti rispettati automaticamente per tutte le settimane generate</li>
+          <li>Camion → turno dalle 07:00 nei giorni configurati, almeno fino all'apertura</li>
+          <li>Periodi ferie rispettati automaticamente</li>
         </ul>
       </div>
 
@@ -415,7 +421,8 @@ function defaultState(){
       sat:{open:true, type:'split',ms:'09:00',me:'13:00',as:'15:30',ae:'19:30'},
       sun:{open:false,type:'split',ms:'09:00',me:'13:00',as:'15:30',ae:'19:30'},
     },
-    maxConcurrentTotal:3, // max persone in negozio contemporaneamente in un giorno
+    maxConcurrentTotal:3,
+    camionDays:{mon:false,tue:false,wed:false,thu:false,fri:false,sat:false,sun:false},
     weekSchedules:[],     // array of {weekStart, days}
     genWeekCount:1,
     currentViewWeekIdx:0,
@@ -613,6 +620,15 @@ function renderGeneratePage(){
   if(!S.currentWeekStart)S.currentWeekStart=isoDate(getMonday(new Date()));
   document.getElementById('numWeeks').value=S.genWeekCount||1;
   updateWeekDisplay();
+  const cd=S.camionDays||{};
+  const labels={mon:'Lun',tue:'Mar',wed:'Mer',thu:'Gio',fri:'Ven',sat:'Sab',sun:'Dom'};
+  document.getElementById('camionDaysGroup').innerHTML=
+    DAYS_KEY.map(k=>`<label class="check-item"><input type="checkbox" id="cam_${k}" ${cd[k]?'checked':''}> ${labels[k]}</label>`).join('');
+}
+function saveCamionDays(){
+  if(!S.camionDays)S.camionDays={mon:false,tue:false,wed:false,thu:false,fri:false,sat:false,sun:false};
+  DAYS_KEY.forEach(k=>{S.camionDays[k]=!!(document.getElementById('cam_'+k)||{}).checked});
+  save();toast('Giorni camion salvati');
 }
 function updateWeekDisplay(){
   if(!S.currentWeekStart)return;
@@ -713,11 +729,12 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     }
   });
 
-  // Assign shifts for each open day
+  // Assign shifts for each open day — supports spezzato (two shifts per employee)
   openDays.forEach(dayKey=>{
     const dayIdx=DAYS_KEY.indexOf(dayKey);
     const sh=S.storeHours[dayKey];
     const dayDate=isoDate(addDays(weekStart,dayIdx));
+    const isSplit=sh.type==='split';
 
     const working=avail.filter(emp=>{
       if(sch.days[dayKey].dayOff.includes(emp.id))return false;
@@ -732,72 +749,113 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return;
     }
 
-    const totalH=dayH(sh);
-    const sorted=[...working].sort((a,b)=>{
-      const hd=(worked[a.id]||0)-(worked[b.id]||0);
-      if(hd!==0)return hd;
-      const pa=(a.takesMorningDelivery?3:0)+(a.canOpenStore?2:0)+(a.isProfumeria?1:0);
-      const pb=(b.takesMorningDelivery?3:0)+(b.canOpenStore?2:0)+(b.isProfumeria?1:0);
-      return pb-pa;
-    });
+    const isMagArea=a=>a.name.toLowerCase().includes('magazzino');
+    const nonMagAreas=S.areas.filter(a=>!isMagArea(a));
+    const magAreas=S.areas.filter(a=>isMagArea(a));
+    const camion={done:false};
 
-    // areaCount tracks how many people per area this day (for maxConcurrent enforcement)
-    const areaCount={};S.areas.forEach(a=>{areaCount[a.id]=0});
-    // Count fixed employees already assigned today
-    sch.days[dayKey].shifts.forEach(s=>{if(areaCount[s.areaId]!=null)areaCount[s.areaId]++});
-    const areasCov=[...S.areas.map(a=>({...a,covered:areaCount[a.id]>0}))];
-    let camionDone=false;
+    // Area-first, cursor-based scheduling.
+    // For each area, fills [pStartT, pEndT] continuously — if one employee leaves early,
+    // next available employee picks up from where they left off.
+    // Non-magazzino areas always processed first; magazzino only if staff remains.
+    // Returns Set of area IDs that achieved full continuous coverage.
+    const coverPeriod=(areaList,pStartT,pEndT)=>{
+      const covered=new Set();
+      const pEndM=t2m(pEndT);
+      const isCamionDay=!!(S.camionDays&&S.camionDays[dayKey]);
 
-    sorted.forEach(emp=>{
-      // Global max concurrent check
-      const maxTotal=S.maxConcurrentTotal;
-      if(maxTotal&&sch.days[dayKey].shifts.length>=maxTotal)return;
+      areaList.forEach(area=>{
+        const minReq=Math.max(1,area.minCoverage||1);
+        const areaMaxC=area.maxConcurrent||999;
+        const isProfArea=area.name.toLowerCase().includes('profumeria');
+        let cursor=t2m(pStartT);
+        let fullyCovered=true;
 
-      const maxH=empMaxH(emp);
-      const remaining=maxH>0?maxH-(worked[emp.id]||0):8;
-      if(remaining<=0.1)return;
-      const availH=Math.min(remaining,8,totalH);
+        while(cursor<pEndM){
+          // Current coverage count at cursor
+          const covering=sch.days[dayKey].shifts.filter(s=>
+            s.areaId===area.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
+          );
+          if(covering.length>=minReq){
+            // Enough people — jump to when coverage might drop
+            cursor=covering.reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            continue;
+          }
+          // Can't add more due to area max-concurrent
+          if(covering.length>=areaMaxC){
+            const nx=covering.reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            cursor=nx; fullyCovered=false; break;
+          }
+          // Global concurrent limit
+          const concNow=sch.days[dayKey].shifts.filter(s=>
+            t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
+          ).length;
+          if(S.maxConcurrentTotal&&concNow>=S.maxConcurrentTotal){
+            fullyCovered=false; break;
+          }
+          // Find best candidate available at cursor
+          const cands=working.filter(emp=>{
+            if(sch.days[dayKey].shifts.some(s=>
+              s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
+            ))return false;
+            const maxH=empMaxH(emp);
+            const remH=maxH>0?maxH-(worked[emp.id]||0):9;
+            return remH>0.24;
+          }).sort((a,b)=>{
+            // Camion employee first at period start on camion days
+            const camA=(a.takesMorningDelivery&&isCamionDay&&!camion.done&&cursor===t2m(pStartT))?100:0;
+            const camB=(b.takesMorningDelivery&&isCamionDay&&!camion.done&&cursor===t2m(pStartT))?100:0;
+            if(camA!==camB)return camB-camA;
+            // Specialty match
+            const profA=(isProfArea&&a.isProfumeria)?10:0;
+            const profB=(isProfArea&&b.isProfumeria)?10:0;
+            if(profA!==profB)return profB-profA;
+            // More remaining hours first (can cover more of the period)
+            const remA=empMaxH(a)>0?empMaxH(a)-(worked[a.id]||0):9;
+            const remB=empMaxH(b)>0?empMaxH(b)-(worked[b.id]||0):9;
+            return remB-remA;
+          });
 
-      let startTime=sh.ms,endTime;
-      if(emp.takesMorningDelivery&&!camionDone){
-        startTime='07:00';
-        endTime=m2t(Math.min(t2m('07:00')+Math.min(availH,8)*60,t2m(sh.ae)));
-        camionDone=true;
-      } else {
-        endTime=m2t(Math.min(t2m(sh.ms)+availH*60,t2m(sh.ae)));
-      }
+          if(!cands.length){fullyCovered=false;break;}
 
-      const actualH=shiftH(startTime,endTime);
-      if(actualH<0.25)return;
+          const emp=cands[0];
+          const camionCond=emp.takesMorningDelivery&&isCamionDay&&!camion.done&&cursor===t2m(pStartT);
+          const startM=camionCond?t2m('07:00'):cursor;
+          if(camionCond)camion.done=true;
 
-      // Area selection respecting per-area maxConcurrent
-      let areaId='';
-      const areaFits=a=>{
-        const mc=S.areas.find(ar=>ar.id===a.id)?.maxConcurrent;
-        return !mc||(areaCount[a.id]||0)<mc;
-      };
-      if(emp.isProfumeria){
-        const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));
-        if(pA&&areaFits(pA)){areaId=pA.id;const ac=areasCov.find(a=>a.id===pA.id);if(ac)ac.covered=true}
-      }
-      if(!areaId){
-        const unc=areasCov.find(a=>!a.covered&&areaFits(a));
-        if(unc){areaId=unc.id;unc.covered=true}
-        else{
-          // All covered — pick area with capacity remaining, prefer magazzino
-          const withCap=S.areas.filter(a=>areaFits(a));
-          const mag=withCap.find(a=>a.name.toLowerCase().includes('magazzino'))||withCap[0];
-          areaId=(mag||S.areas[0]||{id:''}).id;
+          const maxH=empMaxH(emp);
+          const remH=maxH>0?maxH-(worked[emp.id]||0):9;
+          const rawEndM=Math.min(startM+remH*60,pEndM);
+          const endM=camionCond?Math.max(t2m(sh.ms),rawEndM):rawEndM;
+
+          if(endM-startM<15){fullyCovered=false;break;}
+
+          const sT=m2t(startM),eT=m2t(endM);
+          const actualH=shiftH(sT,eT);
+          sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:area.id,hours:actualH});
+          worked[emp.id]=(worked[emp.id]||0)+actualH;
+          cursor=endM;
         }
+
+        if(fullyCovered&&cursor>=pEndM)covered.add(area.id);
+      });
+      return covered;
+    };
+
+    const orderedAreas=[...nonMagAreas,...magAreas];
+    const mornCov=coverPeriod(orderedAreas,sh.ms,isSplit?sh.me:sh.ae);
+    // Pomeriggio split: spezzato usato solo se serve per coprire aree ancora scoperte
+    const aftnCov=isSplit?coverPeriod(orderedAreas,sh.as,sh.ae):new Set([...mornCov]);
+
+    // Avvisi copertura — segnala TUTTE le aree scoperte (magazzino incluso, è eccezione solo in carenza)
+    S.areas.forEach(a=>{
+      const covMorn=mornCov.has(a.id);
+      const covAftn=isSplit?aftnCov.has(a.id):covMorn;
+      if(!covMorn&&!covAftn){
+        warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): area "${a.name}" non coperta (carenza personale)`);
+      } else if(isSplit&&(!covMorn||!covAftn)){
+        warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): "${a.name}" scoperta nel ${!covMorn?'mattino':'pomeriggio'}`);
       }
-
-      if(areaId)areaCount[areaId]=(areaCount[areaId]||0)+1;
-      sch.days[dayKey].shifts.push({employeeId:emp.id,startTime,endTime,areaId,hours:actualH});
-      worked[emp.id]=(worked[emp.id]||0)+actualH;
-    });
-
-    areasCov.forEach(a=>{
-      if(!a.covered)warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): area "${a.name}" non coperta`);
     });
   });
 
@@ -1611,7 +1669,7 @@ function refreshEmpSchedule(empId){
         const remaining=maxH>0?maxH-workedH:8;
         if(remaining<=0.1)return;
         const totalH=dayH(sh);
-        const availH=Math.min(remaining,8,totalH);
+        const availH=Math.min(remaining,totalH);
         const startTime=emp.takesMorningDelivery?'07:00':sh.ms;
         const endTime=m2t(Math.min(t2m(startTime)+availH*60,t2m(sh.ae)));
         const actualH=shiftH(startTime,endTime);
