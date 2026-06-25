@@ -225,11 +225,26 @@ textarea.form-control{resize:vertical;min-height:64px}
       <table>
         <thead><tr>
           <th style="width:50px">Colore</th><th>Nome Area</th>
-          <th>Copertura Min.</th><th>Note</th>
+          <th>Min. dip.</th><th>Max contemp.</th><th>Note</th>
           <th style="width:90px">Azioni</th>
         </tr></thead>
         <tbody id="areaTbody"></tbody>
       </table>
+    </div>
+  </div>
+</div>
+
+  <div class="card" style="margin-top:16px">
+    <div class="card-header"><div class="card-title">Vincoli di Presenza</div></div>
+    <div class="card-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label class="form-label">Max persone totali in negozio (per giorno)</label>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Limite globale: es. 3 significa che non vengono assegnati più di 3 dipendenti in un giorno. 0 = nessun limite.</div>
+          <input type="number" class="form-control" id="maxConcTotal" value="" min="0" max="20" style="width:100px" placeholder="Es. 3">
+        </div>
+      </div>
+      <button class="btn btn-primary btn-sm mt-8" onclick="saveVincoli()">💾 Salva Vincoli</button>
     </div>
   </div>
 </div>
@@ -400,6 +415,7 @@ function defaultState(){
       sat:{open:true, type:'split',ms:'09:00',me:'13:00',as:'15:30',ae:'19:30'},
       sun:{open:false,type:'split',ms:'09:00',me:'13:00',as:'15:30',ae:'19:30'},
     },
+    maxConcurrentTotal:3, // max persone in negozio contemporaneamente in un giorno
     weekSchedules:[],     // array of {weekStart, days}
     genWeekCount:1,
     currentViewWeekIdx:0,
@@ -504,6 +520,7 @@ function switchTab(tab){
   const secEl=document.getElementById(`tab-${tab}`);
   if(secEl)secEl.classList.add('active');
   if(tab==='storehours')renderStoreHours();
+  if(tab==='areas')renderVincoli();
   if(tab==='schedule')renderSchedule();
   if(tab==='generate')renderGeneratePage();
   if(tab==='settings')renderSettings();
@@ -520,6 +537,7 @@ function renderEmployees(){
   tb.innerHTML=S.employees.map(e=>{
     const hoursLbl=e.hoursType==='fixed'?'Orario Fisso':e.hoursType==='38'?'38h/sett':e.hoursType==='40'?'40h/sett':`${e.customHours||'?'}h/sett`;
     const chars=[];
+    if(e.isDirectore)chars.push('<span class="badge b-gray">👔 Direttore</span>');
     if(e.isProfumeria)chars.push('<span class="badge b-purple">🌸 Profumeria</span>');
     if(e.canOpenStore)chars.push('<span class="badge b-blue">🔑 Apertura</span>');
     if(e.takesMorningDelivery)chars.push('<span class="badge b-yellow">🚚 Camion 7:00</span>');
@@ -549,6 +567,7 @@ function renderAreas(){
     <td><span style="width:22px;height:22px;border-radius:4px;display:inline-block;background:${a.color};border:1px solid rgba(0,0,0,.1)"></span></td>
     <td><strong>${esc(a.name)}</strong></td>
     <td>${a.minCoverage||1} dip.</td>
+    <td>${a.maxConcurrent?a.maxConcurrent+' dip.':'<span class="text-muted text-xs">Nessun limite</span>'}</td>
     <td class="text-muted text-xs">${esc(a.notes||'—')}</td>
     <td><div class="flex gap-8"><button class="btn btn-secondary btn-sm btn-icon" onclick="openAreaModal('${a.id}')" title="Modifica">✏️</button><button class="btn btn-danger btn-sm btn-icon" onclick="deleteArea('${a.id}')" title="Elimina">🗑</button></div></td>
   </tr>`).join('');
@@ -644,18 +663,24 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       if(useB)activeSchedule=emp.fixedScheduleB;
     }
 
-    activeSchedule.forEach(fs=>{
+    // Direttore con orario fisso: salta domenica anche se nel turno fisso
+    const effectiveSchedule=emp.isDirectore?activeSchedule.filter(fs=>fs.day!=='sun'):activeSchedule;
+    effectiveSchedule.forEach(fs=>{
       const dk=fs.day;
       if(!sch.days[dk]||!S.storeHours[dk]||!S.storeHours[dk].open)return;
       const h=shiftH(fs.startTime,fs.endTime);
       sch.days[dk].shifts.push({employeeId:emp.id,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:h});
       worked[emp.id]=(worked[emp.id]||0)+h;
     });
-    const workedDays=activeSchedule.map(fs=>fs.day);
-    // For fixed employees also try to rotate rest day
+    const workedDays=effectiveSchedule.map(fs=>fs.day);
+    // Direttore: forza domenica libera; altri: rotazione normale
     const lastRest=restHistory[emp.id];
-    const restDay=openDays.find(d=>!workedDays.includes(d)&&d!==lastRest)
-                 ||openDays.find(d=>!workedDays.includes(d));
+    let restDay;
+    if(emp.isDirectore&&openDays.includes('sun')){
+      restDay='sun';
+    } else {
+      restDay=openDays.find(d=>!workedDays.includes(d)&&d!==lastRest)||openDays.find(d=>!workedDays.includes(d));
+    }
     if(restDay&&!sch.days[restDay].dayOff.includes(emp.id))sch.days[restDay].dayOff.push(emp.id);
   });
 
@@ -668,15 +693,20 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
 
   const restPref=['mon','tue','wed','thu','fri','sat','sun'];
   flexEmps.forEach(emp=>{
-    const lastRest=restHistory[emp.id]; // day off last week — must rotate away
-    const sorted=[...openDays].sort((a,b)=>{
-      // Heavy penalty for repeating same day as last week
-      const penA=(a===lastRest?100:0)+(restCount[a]||0);
-      const penB=(b===lastRest?100:0)+(restCount[b]||0);
-      if(penA!==penB)return penA-penB;
-      return restPref.indexOf(a)-restPref.indexOf(b);
-    });
-    const chosen=sorted[0];
+    const lastRest=restHistory[emp.id];
+    // Direttore: domenica sempre libera se il negozio è aperto domenica
+    let chosen;
+    if(emp.isDirectore&&openDays.includes('sun')){
+      chosen='sun';
+    } else {
+      const sorted=[...openDays].sort((a,b)=>{
+        const penA=(a===lastRest?100:0)+(restCount[a]||0);
+        const penB=(b===lastRest?100:0)+(restCount[b]||0);
+        if(penA!==penB)return penA-penB;
+        return restPref.indexOf(a)-restPref.indexOf(b);
+      });
+      chosen=sorted[0];
+    }
     if(chosen&&!sch.days[chosen].dayOff.includes(emp.id)){
       sch.days[chosen].dayOff.push(emp.id);
       restCount[chosen]=(restCount[chosen]||0)+1;
@@ -711,10 +741,18 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return pb-pa;
     });
 
-    const areasCov=[...S.areas.map(a=>({...a,covered:false}))];
+    // areaCount tracks how many people per area this day (for maxConcurrent enforcement)
+    const areaCount={};S.areas.forEach(a=>{areaCount[a.id]=0});
+    // Count fixed employees already assigned today
+    sch.days[dayKey].shifts.forEach(s=>{if(areaCount[s.areaId]!=null)areaCount[s.areaId]++});
+    const areasCov=[...S.areas.map(a=>({...a,covered:areaCount[a.id]>0}))];
     let camionDone=false;
 
     sorted.forEach(emp=>{
+      // Global max concurrent check
+      const maxTotal=S.maxConcurrentTotal;
+      if(maxTotal&&sch.days[dayKey].shifts.length>=maxTotal)return;
+
       const maxH=empMaxH(emp);
       const remaining=maxH>0?maxH-(worked[emp.id]||0):8;
       if(remaining<=0.1)return;
@@ -732,17 +770,28 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       const actualH=shiftH(startTime,endTime);
       if(actualH<0.25)return;
 
+      // Area selection respecting per-area maxConcurrent
       let areaId='';
+      const areaFits=a=>{
+        const mc=S.areas.find(ar=>ar.id===a.id)?.maxConcurrent;
+        return !mc||(areaCount[a.id]||0)<mc;
+      };
       if(emp.isProfumeria){
         const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));
-        if(pA){areaId=pA.id;const ac=areasCov.find(a=>a.id===pA.id);if(ac)ac.covered=true}
+        if(pA&&areaFits(pA)){areaId=pA.id;const ac=areasCov.find(a=>a.id===pA.id);if(ac)ac.covered=true}
       }
       if(!areaId){
-        const unc=areasCov.find(a=>!a.covered);
+        const unc=areasCov.find(a=>!a.covered&&areaFits(a));
         if(unc){areaId=unc.id;unc.covered=true}
-        else{const mag=S.areas.find(a=>a.name.toLowerCase().includes('magazzino'));areaId=(mag||S.areas[0]||{id:''}).id}
+        else{
+          // All covered — pick area with capacity remaining, prefer magazzino
+          const withCap=S.areas.filter(a=>areaFits(a));
+          const mag=withCap.find(a=>a.name.toLowerCase().includes('magazzino'))||withCap[0];
+          areaId=(mag||S.areas[0]||{id:''}).id;
+        }
       }
 
+      if(areaId)areaCount[areaId]=(areaCount[areaId]||0)+1;
       sch.days[dayKey].shifts.push({employeeId:emp.id,startTime,endTime,areaId,hours:actualH});
       worked[emp.id]=(worked[emp.id]||0)+actualH;
     });
@@ -1314,6 +1363,7 @@ function openEmpModal(id){
       <div class="form-group mb-16">
         <label class="form-label">Caratteristiche</label>
         <div class="check-group mt-8">
+          <label class="check-item"><input type="checkbox" id="eDir" ${emp&&emp.isDirectore?'checked':''}> 👔 Direttore (domenica sempre libera)</label>
           <label class="check-item"><input type="checkbox" id="eProf" ${emp&&emp.isProfumeria?'checked':''}> 🌸 Specializzato Profumeria</label>
           <label class="check-item"><input type="checkbox" id="eOpen" ${emp&&emp.canOpenStore?'checked':''}> 🔑 Abilitato Apertura</label>
           <label class="check-item"><input type="checkbox" id="eCamion" ${emp&&emp.takesMorningDelivery?'checked':''}> 🚚 Prende Camion (7:00)</label>
@@ -1442,6 +1492,7 @@ function saveEmp(existId){
     fixedSchedule:ht.value==='fixed'?collectFs():[],
     fixedScheduleB:ht.value==='fixed'&&document.getElementById('eBiweekly').checked?collectFsB():[],
     biweeklyFirstWeek:ht.value==='fixed'&&document.getElementById('eBiweekly').checked?(document.querySelector('input[name="eBwFirst"]:checked')||{value:'A'}).value:'A',
+    isDirectore:document.getElementById('eDir').checked,
     isProfumeria:document.getElementById('eProf').checked,
     canOpenStore:document.getElementById('eOpen').checked,
     takesMorningDelivery:document.getElementById('eCamion').checked,
@@ -1511,26 +1562,37 @@ function refreshEmpSchedule(empId){
         const startOffset=emp.biweeklyFirstWeek==='B'?1:0;
         if((weekIdx+startOffset)%2===1)activeSch=emp.fixedScheduleB;
       }
-      activeSch.forEach(fs=>{
+      const effectiveSch=emp.isDirectore?activeSch.filter(fs=>fs.day!=='sun'):activeSch;
+      effectiveSch.forEach(fs=>{
         const dk=fs.day;
         if(!sch.days[dk]||!S.storeHours[dk]||!S.storeHours[dk].open)return;
         sch.days[dk].shifts.push({employeeId:empId,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:shiftH(fs.startTime,fs.endTime)});
       });
-      const workedDays=activeSch.map(fs=>fs.day);
-      const restDay=openDays.find(d=>!workedDays.includes(d)&&d!==lastRest)||openDays.find(d=>!workedDays.includes(d));
+      const workedDays=effectiveSch.map(fs=>fs.day);
+      let restDay;
+      if(emp.isDirectore&&openDays.includes('sun')){
+        restDay='sun';
+      } else {
+        restDay=openDays.find(d=>!workedDays.includes(d)&&d!==lastRest)||openDays.find(d=>!workedDays.includes(d));
+      }
       if(restDay&&!sch.days[restDay].dayOff.includes(empId))sch.days[restDay].dayOff.push(empId);
       lastRest=restDay;
     } else {
       // Flex employee — pick rest day (rotate, prefer less-crowded days)
       const restCount={};
       openDays.forEach(d=>{restCount[d]=(sch.days[d].dayOff||[]).filter(id=>id!==empId).length});
-      const sortedForRest=[...openDays].sort((a,b)=>{
-        const penA=(a===lastRest?100:0)+(restCount[a]||0);
-        const penB=(b===lastRest?100:0)+(restCount[b]||0);
-        if(penA!==penB)return penA-penB;
-        return restPrefLocal.indexOf(a)-restPrefLocal.indexOf(b);
-      });
-      const restDay=sortedForRest[0];
+      let restDay;
+      if(emp.isDirectore&&openDays.includes('sun')){
+        restDay='sun';
+      } else {
+        const sortedForRest=[...openDays].sort((a,b)=>{
+          const penA=(a===lastRest?100:0)+(restCount[a]||0);
+          const penB=(b===lastRest?100:0)+(restCount[b]||0);
+          if(penA!==penB)return penA-penB;
+          return restPrefLocal.indexOf(a)-restPrefLocal.indexOf(b);
+        });
+        restDay=sortedForRest[0];
+      }
       if(restDay)sch.days[restDay].dayOff.push(empId);
       lastRest=restDay;
 
@@ -1554,11 +1616,14 @@ function refreshEmpSchedule(empId){
         const endTime=m2t(Math.min(t2m(startTime)+availH*60,t2m(sh.ae)));
         const actualH=shiftH(startTime,endTime);
         if(actualH<0.25)return;
-        // Find uncovered area; profumeria specialist gets profumeria
-        const coveredAreas=sch.days[dayKey].shifts.map(s=>s.areaId);
+        // Global max concurrent check
+        if(S.maxConcurrentTotal&&sch.days[dayKey].shifts.length>=S.maxConcurrentTotal)return;
+        // Find uncovered area respecting per-area maxConcurrent
+        const areaCountR={};S.areas.forEach(a=>{areaCountR[a.id]=sch.days[dayKey].shifts.filter(s=>s.areaId===a.id).length});
+        const areaFitsR=a=>{const mc=a.maxConcurrent;return !mc||(areaCountR[a.id]||0)<mc};
         let areaId='';
-        if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA)areaId=pA.id}
-        if(!areaId){const unc=S.areas.find(a=>!coveredAreas.includes(a.id));areaId=unc?unc.id:(S.areas[0]||{id:''}).id}
+        if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA&&areaFitsR(pA))areaId=pA.id}
+        if(!areaId){const unc=S.areas.find(a=>!areaCountR[a.id]&&areaFitsR(a));areaId=unc?unc.id:(S.areas.find(a=>areaFitsR(a))||S.areas[0]||{id:''}).id}
         sch.days[dayKey].shifts.push({employeeId:empId,startTime,endTime,areaId,hours:actualH});
         workedH+=actualH;
       });
@@ -1579,7 +1644,10 @@ function openAreaModal(id){
     <div class="modal-body">
       <div class="form-group mb-14"><label class="form-label">Nome Area *</label><input type="text" class="form-control" id="aName" value="${esc(area?area.name:'')}" placeholder="Es. Cassa, Profumeria..."></div>
       <div class="form-group mb-14"><label class="form-label">Colore</label><div class="color-options mt-8" id="colorOpts">${swatches}</div><input type="hidden" id="aColor" value="${curColor}"></div>
-      <div class="form-group mb-14"><label class="form-label">Copertura Minima (nr. dipendenti)</label><input type="number" class="form-control" id="aMinCov" value="${area?area.minCoverage:1}" min="0" max="10" style="width:90px"></div>
+      <div class="form-grid mb-14">
+        <div class="form-group"><label class="form-label">Copertura Minima (nr. dipendenti)</label><input type="number" class="form-control" id="aMinCov" value="${area?area.minCoverage:1}" min="0" max="10" style="width:90px"></div>
+        <div class="form-group"><label class="form-label">Max contemporanee in quest'area</label><div style="font-size:11px;color:var(--muted);margin-bottom:4px">0 = nessun limite</div><input type="number" class="form-control" id="aMaxCon" value="${area&&area.maxConcurrent!=null?area.maxConcurrent:0}" min="0" max="10" style="width:90px"></div>
+      </div>
       <div class="form-group"><label class="form-label">Note</label><textarea class="form-control" id="aNotes" rows="2">${esc(area?area.notes||'':'')}</textarea></div>
     </div>
     <div class="modal-footer">
@@ -1591,13 +1659,23 @@ function openAreaModal(id){
 function pickColor(c){document.querySelectorAll('.color-swatch').forEach(s=>s.classList.toggle('selected',s.dataset.c===c));document.getElementById('aColor').value=c}
 function saveArea(existId){
   const name=document.getElementById('aName').value.trim();if(!name){alert('Inserisci il nome dell\'area');return}
-  const data={id:existId||uid(),name,color:document.getElementById('aColor').value,minCoverage:parseInt(document.getElementById('aMinCov').value)||1,notes:document.getElementById('aNotes').value.trim()};
+  const maxCon=parseInt(document.getElementById('aMaxCon').value)||0;
+  const data={id:existId||uid(),name,color:document.getElementById('aColor').value,minCoverage:parseInt(document.getElementById('aMinCov').value)||1,maxConcurrent:maxCon>0?maxCon:null,notes:document.getElementById('aNotes').value.trim()};
   if(existId){const i=S.areas.findIndex(a=>a.id===existId);if(i>=0)S.areas[i]=data}else S.areas.push(data);
   save();closeModal();renderAreas();toast(existId?'Area aggiornata ✓':'Area aggiunta ✓');
 }
 function deleteArea(id){
   const area=S.areas.find(a=>a.id===id);if(!area)return;
   confirm2(`Eliminare area "${area.name}"?`,'I turni perderanno il riferimento area.',()=>{S.areas=S.areas.filter(a=>a.id!==id);save();closeModal();renderAreas();toast('Area eliminata')});
+}
+function saveVincoli(){
+  const v=parseInt(document.getElementById('maxConcTotal').value)||0;
+  S.maxConcurrentTotal=v>0?v:null;
+  save();toast('Vincoli salvati ✓');
+}
+function renderVincoli(){
+  const el=document.getElementById('maxConcTotal');
+  if(el)el.value=S.maxConcurrentTotal||'';
 }
 
 /* ═══════════════ SETTINGS ═══════════════ */
