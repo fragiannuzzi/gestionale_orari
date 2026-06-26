@@ -825,7 +825,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
 
           const maxH=empMaxH(emp);
           const remH=maxH>0?maxH-(worked[emp.id]||0):9;
-          const rawEndM=Math.min(startM+remH*60,pEndM);
+          const rawEndM=Math.min(startM+remH*60,startM+6*60,pEndM); // max 6h consecutive
           const endM=camionCond?Math.max(t2m(sh.ms),rawEndM):rawEndM;
 
           if(endM-startM<15){fullyCovered=false;break;}
