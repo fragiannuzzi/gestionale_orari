@@ -752,17 +752,50 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     const isMagArea=a=>a.name.toLowerCase().includes('magazzino');
     const nonMagAreas=S.areas.filter(a=>!isMagArea(a));
     const magAreas=S.areas.filter(a=>isMagArea(a));
-    const camion={done:false};
 
-    // Area-first, cursor-based scheduling.
-    // For each area, fills [pStartT, pEndT] continuously — if one employee leaves early,
-    // next available employee picks up from where they left off.
-    // Non-magazzino areas always processed first; magazzino only if staff remains.
-    // Returns Set of area IDs that achieved full continuous coverage.
+    // Ore consecutive accumulate da empId fino a cursorM (catena senza gap ≥2h)
+    const consecHAt=(empId,cursorM)=>{
+      const prevS=sch.days[dayKey].shifts
+        .filter(s=>s.employeeId===empId&&t2m(s.endTime)<=cursorM)
+        .sort((a,b)=>t2m(b.startTime)-t2m(a.startTime));
+      let mins=0,ref=cursorM;
+      for(const s of prevS){
+        if(ref-t2m(s.endTime)>=120)break; // gap ≥2h → catena interrotta
+        mins+=t2m(s.endTime)-t2m(s.startTime);
+        ref=t2m(s.startTime);
+      }
+      return mins/60;
+    };
+
+    // Camion: in giorni con consegna, l'addetto parte alle 07:00 in Magazzino fino all'apertura.
+    // Le altre aree NON devono essere presidiate prima dell'orario di apertura.
+    const isCamionDay=!!(S.camionDays&&S.camionDays[dayKey]);
+    if(isCamionDay&&magAreas.length&&t2m(sh.ms)>t2m('07:00')){
+      const camEmp=working.find(e=>e.takesMorningDelivery);
+      if(camEmp){
+        const camH=shiftH('07:00',sh.ms);
+        sch.days[dayKey].shifts.push({employeeId:camEmp.id,startTime:'07:00',endTime:sh.ms,areaId:magAreas[0].id,hours:camH});
+        worked[camEmp.id]=(worked[camEmp.id]||0)+camH;
+      }
+    }
+
+    // Calcola rawEndM per un candidato dato cursor e pEndM
+    const calcRawEnd=(emp,cursor,pEndM)=>{
+      const maxH=empMaxH(emp);
+      const remH=maxH>0?maxH-(worked[emp.id]||0):9;
+      const consec=consecHAt(emp.id,cursor);
+      const maxConsecRem=Math.max(0,6-consec);
+      const nextFut=sch.days[dayKey].shifts
+        .filter(s=>s.employeeId===emp.id&&t2m(s.startTime)>cursor)
+        .sort((a,b)=>t2m(a.startTime)-t2m(b.startTime))[0];
+      const futureCap=nextFut?t2m(nextFut.startTime)-120:pEndM;
+      return Math.min(cursor+remH*60,cursor+maxConsecRem*60,futureCap,pEndM);
+    };
+
+    // Area-first, cursor-based scheduling
     const coverPeriod=(areaList,pStartT,pEndT)=>{
       const covered=new Set();
       const pEndM=t2m(pEndT);
-      const isCamionDay=!!(S.camionDays&&S.camionDays[dayKey]);
 
       areaList.forEach(area=>{
         const minReq=Math.max(1,area.minCoverage||1);
@@ -772,45 +805,44 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
         let fullyCovered=true;
 
         while(cursor<pEndM){
-          // Current coverage count at cursor
           const covering=sch.days[dayKey].shifts.filter(s=>
             s.areaId===area.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           );
           if(covering.length>=minReq){
-            // Enough people — jump to when coverage might drop
             cursor=covering.reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
             continue;
           }
-          // Can't add more due to area max-concurrent
           if(covering.length>=areaMaxC){
-            const nx=covering.reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
-            cursor=nx; fullyCovered=false; break;
+            cursor=covering.reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            fullyCovered=false; break;
           }
-          // Global concurrent limit
+
           const concNow=sch.days[dayKey].shifts.filter(s=>
             t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           ).length;
           if(S.maxConcurrentTotal&&concNow>=S.maxConcurrentTotal){
-            fullyCovered=false; break;
+            // slot globale pieno: aspetta che si liberi uno slot invece di abbandonare l'area
+            const nx=sch.days[dayKey].shifts
+              .filter(s=>t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor)
+              .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            fullyCovered=false;
+            if(nx>=pEndM)break;
+            cursor=nx;
+            continue;
           }
-          // Find best candidate available at cursor
+
           const cands=working.filter(emp=>{
             if(sch.days[dayKey].shifts.some(s=>
               s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
             ))return false;
+            if(consecHAt(emp.id,cursor)>4)return false;
             const maxH=empMaxH(emp);
             const remH=maxH>0?maxH-(worked[emp.id]||0):9;
             return remH>0.24;
           }).sort((a,b)=>{
-            // Camion employee first at period start on camion days
-            const camA=(a.takesMorningDelivery&&isCamionDay&&!camion.done&&cursor===t2m(pStartT))?100:0;
-            const camB=(b.takesMorningDelivery&&isCamionDay&&!camion.done&&cursor===t2m(pStartT))?100:0;
-            if(camA!==camB)return camB-camA;
-            // Specialty match
             const profA=(isProfArea&&a.isProfumeria)?10:0;
             const profB=(isProfArea&&b.isProfumeria)?10:0;
             if(profA!==profB)return profB-profA;
-            // More remaining hours first (can cover more of the period)
             const remA=empMaxH(a)>0?empMaxH(a)-(worked[a.id]||0):9;
             const remB=empMaxH(b)>0?empMaxH(b)-(worked[b.id]||0):9;
             return remB-remA;
@@ -818,23 +850,28 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
 
           if(!cands.length){fullyCovered=false;break;}
 
-          const emp=cands[0];
-          const camionCond=emp.takesMorningDelivery&&isCamionDay&&!camion.done&&cursor===t2m(pStartT);
-          const startM=camionCond?t2m('07:00'):cursor;
-          if(camionCond)camion.done=true;
-
-          const maxH=empMaxH(emp);
-          const remH=maxH>0?maxH-(worked[emp.id]||0):9;
-          const rawEndM=Math.min(startM+remH*60,startM+6*60,pEndM); // max 6h consecutive
-          const endM=camionCond?Math.max(t2m(sh.ms),rawEndM):rawEndM;
-
-          if(endM-startM<15){fullyCovered=false;break;}
-
-          const sT=m2t(startM),eT=m2t(endM);
-          const actualH=shiftH(sT,eT);
-          sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:area.id,hours:actualH});
-          worked[emp.id]=(worked[emp.id]||0)+actualH;
-          cursor=endM;
+          // Prova ogni candidato in ordine finché uno può coprire ≥15min
+          let assigned=false;
+          for(const emp of cands){
+            const rawEndM=calcRawEnd(emp,cursor,pEndM);
+            if(rawEndM-cursor<15)continue; // bloccato da futureCap/consecutive → prova prossimo
+            const sT=m2t(cursor),eT=m2t(rawEndM);
+            const actualH=shiftH(sT,eT);
+            sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:area.id,hours:actualH});
+            worked[emp.id]=(worked[emp.id]||0)+actualH;
+            cursor=rawEndM;
+            assigned=true;
+            break;
+          }
+          if(!assigned){
+            // nessun candidato può lavorare ORA: avanza al prossimo rilascio di slot
+            const nextRelease=sch.days[dayKey].shifts
+              .filter(s=>t2m(s.endTime)>cursor&&t2m(s.endTime)<pEndM)
+              .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            fullyCovered=false;
+            if(nextRelease>=pEndM)break;
+            cursor=nextRelease;
+          }
         }
 
         if(fullyCovered&&cursor>=pEndM)covered.add(area.id);
@@ -844,8 +881,91 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
 
     const orderedAreas=[...nonMagAreas,...magAreas];
     const mornCov=coverPeriod(orderedAreas,sh.ms,isSplit?sh.me:sh.ae);
-    // Pomeriggio split: spezzato usato solo se serve per coprire aree ancora scoperte
     const aftnCov=isSplit?coverPeriod(orderedAreas,sh.as,sh.ae):new Set([...mornCov]);
+
+    // Riempimento ore contrattuali: dopo la copertura minima, usa le ore rimanenti di contratto
+    // di ogni dipendente assegnando turni aggiuntivi in qualsiasi area disponibile.
+    // Regola principale: ogni dipendente deve fare TUTTE le ore previste dal contratto ogni settimana.
+    const fillHours=(pStartT,pEndT)=>{
+      const pStartM=t2m(pStartT),pEndM=t2m(pEndT);
+      // Ordina: più ore rimanenti prima (più urgente completare il contratto)
+      const sortedW=[...working].sort((a,b)=>{
+        const rA=empMaxH(a)>0?empMaxH(a)-(worked[a.id]||0):0;
+        const rB=empMaxH(b)>0?empMaxH(b)-(worked[b.id]||0):0;
+        return rB-rA;
+      });
+      sortedW.forEach(emp=>{
+        const maxH=empMaxH(emp);
+        if(maxH<=0)return; // orario fisso senza limite ore → gestito altrove
+        let cursor=pStartM;
+        while(cursor<pEndM){
+          const remH=maxH-(worked[emp.id]||0);
+          if(remH<=0.24)break; // ore contratto completate
+          // già al lavoro in questo momento → salta alla fine del turno attivo
+          const act=sch.days[dayKey].shifts.find(s=>
+            s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
+          );
+          if(act){cursor=t2m(act.endTime);continue;}
+          // regola pausa: >4h consecutive → salta 2h
+          const consec=consecHAt(emp.id,cursor);
+          if(consec>4){cursor=Math.min(cursor+120,pEndM);continue;}
+          // limite globale contemporanei → avanza a quando si libera uno slot
+          const concNow=sch.days[dayKey].shifts.filter(s=>
+            t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
+          ).length;
+          if(S.maxConcurrentTotal&&concNow>=S.maxConcurrentTotal){
+            const nx=sch.days[dayKey].shifts
+              .filter(s=>t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor)
+              .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            cursor=nx;continue;
+          }
+          // calcola fine turno rispettando: ore rimaste, max consecutive, gap futuro
+          const maxCR=Math.max(0,6-consec);
+          const nxFut=sch.days[dayKey].shifts
+            .filter(s=>s.employeeId===emp.id&&t2m(s.startTime)>cursor)
+            .sort((a,b)=>t2m(a.startTime)-t2m(b.startTime))[0];
+          const fCap=nxFut?t2m(nxFut.startTime)-120:pEndM;
+          const rawE=Math.min(cursor+remH*60,cursor+maxCR*60,fCap,pEndM);
+          if(rawE-cursor<15){
+            // slot troppo corto: salta al prossimo turno futuro o esci
+            if(nxFut&&t2m(nxFut.startTime)<pEndM){cursor=t2m(nxFut.startTime);}
+            else break;
+            continue;
+          }
+          // migliore area: prima le aree con meno presenti (scoperte prioritarie), non-mag prima
+          const bestA=orderedAreas
+            .filter(a=>{
+              const mc=a.maxConcurrent||999;
+              const cc=sch.days[dayKey].shifts.filter(s=>
+                s.areaId===a.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
+              ).length;
+              return cc<mc;
+            })
+            .sort((a,b)=>{
+              const ccA=sch.days[dayKey].shifts.filter(s=>s.areaId===a.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor).length;
+              const ccB=sch.days[dayKey].shifts.filter(s=>s.areaId===b.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor).length;
+              return ccA-ccB; // meno presenti prima (scoperte prioritarie)
+            })[0];
+          if(!bestA){
+            // tutte le aree al limite → avanza a quando si libera uno slot
+            const nx2=sch.days[dayKey].shifts
+              .filter(s=>t2m(s.endTime)>cursor&&t2m(s.endTime)<=pEndM)
+              .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
+            cursor=nx2;continue;
+          }
+          const sT=m2t(cursor),eT=m2t(rawE);
+          const actualH=shiftH(sT,eT);
+          sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:bestA.id,hours:actualH});
+          worked[emp.id]=(worked[emp.id]||0)+actualH;
+          cursor=rawE;
+        }
+      });
+    };
+    // Più passaggi: ogni pass cattura slot liberati dal pass precedente
+    for(let _p=0;_p<4;_p++){
+      fillHours(sh.ms,isSplit?sh.me:sh.ae);
+      if(isSplit)fillHours(sh.as,sh.ae);
+    }
 
     // Avvisi copertura — segnala TUTTE le aree scoperte (magazzino incluso, è eccezione solo in carenza)
     S.areas.forEach(a=>{
@@ -857,6 +977,28 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
         warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): "${a.name}" scoperta nel ${!covMorn?'mattino':'pomeriggio'}`);
       }
     });
+  });
+
+  // Avviso capacità strutturale: ore contratto vs slot disponibili
+  if(S.maxConcurrentTotal){
+    const totalContracted=flexEmps.reduce((s,e)=>s+(empMaxH(e)||0),0);
+    const totalOpenH=openDays.reduce((s,dk)=>{
+      const sh=S.storeHours[dk];if(!sh)return s;
+      const mH=(t2m(sh.type==='split'?sh.me:sh.ae)-t2m(sh.ms))/60;
+      const aH=sh.type==='split'?(t2m(sh.ae)-t2m(sh.as))/60:0;
+      return s+mH+aH;
+    },0);
+    const weekCap=S.maxConcurrentTotal*totalOpenH;
+    if(totalContracted>weekCap+0.5){
+      warnings.push(`⚠️ Capacità insufficiente: ${totalContracted}h contrattuali vs ${Math.round(weekCap*10)/10}h disponibili (${S.maxConcurrentTotal} presenze × ${Math.round(totalOpenH*10)/10}h/sett). Impossibile coprire tutte le ore — aumenta il limite presenze contemporanee.`);
+    }
+  }
+
+  // Avviso ore mancanti per dipendente
+  flexEmps.forEach(e=>{
+    const maxH=empMaxH(e); if(!maxH)return;
+    const missing=Math.round((maxH-(worked[e.id]||0))*10)/10;
+    if(missing>0.5) warnings.push(`${weekRange(weekStartISO)}: ${e.name} — ${missing}h mancanti (${Math.round((worked[e.id]||0)*10)/10}h su ${maxH}h contratto)`);
   });
 
   return {weekStart:weekStartISO,days:sch.days,worked};
@@ -960,14 +1102,16 @@ function showGenPreview(weekIdx){
     const max=empMaxH(emp);
     const w=Math.round((worked[emp.id]||0)*10)/10;
     const pct=max>0?Math.min((w/max)*100,100):0;
-    const over=max>0&&w>max;const near=!over&&pct>85;
+    const over=max>0&&w>max;
+    const full=!over&&max>0&&pct>=99.5; // ≥99.5% = pieno (gestisce arrotondamenti)
+    const near=!over&&!full&&pct>85;
     let restDay='—';
     DAYS_KEY.forEach((k,i)=>{if(sch.days[k]&&sch.days[k].dayOff.includes(emp.id)){restDay=DAYS_FULL[i]+((!S.storeHours[k]||!S.storeHours[k].open)?' (chiusura)':'');}});
     return `<tr>
       <td><strong>${esc(emp.name)}</strong></td>
       <td>${max>0?max+'h':'Fisso'}</td>
       <td>${w}h<div class="hrs-bar"><div class="hrs-fill ${over?'over':near?'near':''}" style="width:${pct}%"></div></div></td>
-      <td>${over?'<span class="badge b-red">Ore eccedute</span>':near?'<span class="badge b-yellow">Quasi pieno</span>':'<span class="badge b-green">✓ OK</span>'}</td>
+      <td>${over?'<span class="badge b-red">Ore eccedute</span>':full?'<span class="badge b-green">✓ Pieno</span>':near?'<span class="badge b-yellow">Quasi pieno</span>':'<span class="badge b-green">✓ OK</span>'}</td>
       <td>${restDay}</td>
     </tr>`;
   }).join('');
