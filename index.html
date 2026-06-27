@@ -127,7 +127,11 @@ textarea.form-control{resize:vertical;min-height:64px}
 .hrs-fill{height:100%;background:var(--accent);border-radius:2px;transition:width 300ms}
 .hrs-fill.over{background:var(--danger)}.hrs-fill.near{background:var(--warning)}
 /* ── FIXED SCHED ROWS ── */
-.fs-row{display:grid;grid-template-columns:120px 100px 100px 1fr 32px;gap:7px;align-items:center;margin-bottom:7px}
+.fs-row{background:#F8F9FA;border:1px solid var(--border);border-radius:5px;padding:10px;margin-bottom:8px}
+.fs-row-top{display:grid;grid-template-columns:130px 1fr auto;gap:8px;align-items:center;margin-bottom:6px}
+.fs-times{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.fs-split-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)}
+.fs-label{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.05em;margin-bottom:3px}
 /* ── VACATION ROWS ── */
 .vac-row{display:grid;grid-template-columns:1fr 1fr 1fr 32px;gap:8px;align-items:center;margin-bottom:7px;padding:8px;background:#FFF5F5;border-radius:4px;border:1px solid #F5C6CB}
 /* ── EMERGENCY PANEL ── */
@@ -847,11 +851,21 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     effectiveSchedule.forEach(fs=>{
       const dk=fs.day;
       if(!sch.days[dk]||!S.storeHours[dk]||!S.storeHours[dk].open)return;
-      const h=shiftH(fs.startTime,fs.endTime);
-      sch.days[dk].shifts.push({employeeId:emp.id,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:h});
-      worked[emp.id]=(worked[emp.id]||0)+h;
+      if(fs.type==='split'&&fs.startTime2&&fs.endTime2){
+        // Turno spezzato: due shift separati
+        const h1=shiftH(fs.startTime,fs.endTime);
+        const h2=shiftH(fs.startTime2,fs.endTime2);
+        sch.days[dk].shifts.push({employeeId:emp.id,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:h1});
+        sch.days[dk].shifts.push({employeeId:emp.id,startTime:fs.startTime2,endTime:fs.endTime2,areaId:fs.areaId2||fs.areaId||'',hours:h2});
+        worked[emp.id]=(worked[emp.id]||0)+h1+h2;
+      } else {
+        // Turno continuato (o legacy senza tipo)
+        const h=shiftH(fs.startTime,fs.endTime);
+        sch.days[dk].shifts.push({employeeId:emp.id,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:h});
+        worked[emp.id]=(worked[emp.id]||0)+h;
+      }
     });
-    const workedDays=effectiveSchedule.map(fs=>fs.day);
+    const workedDays=[...new Set(effectiveSchedule.map(fs=>fs.day))];
     const lastRest=restHistory[emp.id];
     let restDay;
     if(emp.isDirectore&&openDays.includes('sun')){
@@ -2037,34 +2051,174 @@ function rmVacRow(idx){const r=document.getElementById(`vr_${idx}`);if(r)r.remov
 function buildFsRow(fs,idx){
   const dayOpts=DAYS_KEY.map((k,i)=>`<option value="${k}" ${fs.day===k?'selected':''}>${DAYS_FULL[i]}</option>`).join('');
   const areaOpts=S.areas.map(a=>`<option value="${a.id}" ${fs.areaId===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const areaOpts2=S.areas.map(a=>`<option value="${a.id}" ${fs.areaId2===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const isSplit=fs.type==='split';
   return `<div class="fs-row" id="fsr_${idx}">
-    <select class="form-control" id="fsd_${idx}">${dayOpts}</select>
-    <input type="time" class="form-control" id="fss_${idx}" value="${fs.startTime||'09:00'}">
-    <input type="time" class="form-control" id="fse_${idx}" value="${fs.endTime||'17:00'}">
-    <select class="form-control" id="fsa_${idx}">${areaOpts}</select>
-    <button class="btn btn-danger btn-sm btn-icon" type="button" onclick="rmFsRow('${idx}')">×</button>
+    <div class="fs-row-top">
+      <select class="form-control" id="fsd_${idx}">${dayOpts}</select>
+      <div style="display:flex;gap:14px;align-items:center">
+        <label class="check-item" style="font-size:12px"><input type="radio" name="fstype_${idx}" value="continuous" ${!isSplit?'checked':''} onchange="toggleFsType('${idx}','continuous')"> Continuato</label>
+        <label class="check-item" style="font-size:12px"><input type="radio" name="fstype_${idx}" value="split" ${isSplit?'checked':''} onchange="toggleFsType('${idx}','split')"> Con pausa pranzo</label>
+      </div>
+      <button class="btn btn-danger btn-sm btn-icon" type="button" onclick="rmFsRow('${idx}')">×</button>
+    </div>
+    <div id="fscont_${idx}" ${isSplit?'style="display:none"':''}>
+      <div class="fs-times">
+        <div><div class="fs-label">Inizio</div><input type="time" class="form-control time-input" id="fss_${idx}" value="${fs.startTime||'09:00'}"></div>
+        <span style="padding-top:16px;color:var(--muted)">–</span>
+        <div><div class="fs-label">Fine</div><input type="time" class="form-control time-input" id="fse_${idx}" value="${fs.endTime||'17:00'}"></div>
+        <div style="flex:1"><div class="fs-label">Area</div><select class="form-control" id="fsa_${idx}">${areaOpts}</select></div>
+      </div>
+    </div>
+    <div id="fssplit_${idx}" ${!isSplit?'style="display:none"':''}>
+      <div class="fs-split-row">
+        <div>
+          <div class="fs-label">🌅 Mattina</div>
+          <div class="fs-times">
+            <input type="time" class="form-control time-input" id="fss1_${idx}" value="${fs.startTime||'09:00'}" style="width:100px">
+            <span style="color:var(--muted)">–</span>
+            <input type="time" class="form-control time-input" id="fse1_${idx}" value="${fs.endTime||'13:00'}" style="width:100px">
+          </div>
+          <select class="form-control mt-4" id="fsa1_${idx}">${areaOpts}</select>
+        </div>
+        <div>
+          <div class="fs-label">🌆 Pomeriggio</div>
+          <div class="fs-times">
+            <input type="time" class="form-control time-input" id="fss2_${idx}" value="${fs.startTime2||'15:30'}" style="width:100px">
+            <span style="color:var(--muted)">–</span>
+            <input type="time" class="form-control time-input" id="fse2_${idx}" value="${fs.endTime2||'19:30'}" style="width:100px">
+          </div>
+          <select class="form-control mt-4" id="fsa2_${idx}">${areaOpts2||areaOpts}</select>
+        </div>
+      </div>
+    </div>
   </div>`;
 }
-function addFsRow(){_fsIdx++;const c=document.getElementById('fsRows');const d=document.createElement('div');d.innerHTML=buildFsRow({day:'mon',startTime:'09:00',endTime:'17:00',areaId:(S.areas[0]||{}).id||''},'n'+_fsIdx);c.appendChild(d.firstElementChild)}
+function toggleFsType(idx,type){
+  document.getElementById('fscont_'+idx).style.display=type==='split'?'none':'';
+  document.getElementById('fssplit_'+idx).style.display=type==='split'?'':'none';
+}
+function addFsRow(){
+  _fsIdx++;
+  const c=document.getElementById('fsRows');
+  const d=document.createElement('div');
+  d.innerHTML=buildFsRow({day:'mon',type:'continuous',startTime:'09:00',endTime:'17:00',areaId:(S.areas[0]||{}).id||''},'n'+_fsIdx);
+  c.appendChild(d.firstElementChild);
+}
 function rmFsRow(idx){const r=document.getElementById(`fsr_${idx}`);if(r)r.remove()}
 
 function buildFsBRow(fs,idx){
   const dayOpts=DAYS_KEY.map((k,i)=>`<option value="${k}" ${fs.day===k?'selected':''}>${DAYS_FULL[i]}</option>`).join('');
   const areaOpts=S.areas.map(a=>`<option value="${a.id}" ${fs.areaId===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const areaOpts2=S.areas.map(a=>`<option value="${a.id}" ${fs.areaId2===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const isSplit=fs.type==='split';
   return `<div class="fs-row" id="fsrb_${idx}">
-    <select class="form-control" id="fsdb_${idx}">${dayOpts}</select>
-    <input type="time" class="form-control" id="fssb_${idx}" value="${fs.startTime||'09:00'}">
-    <input type="time" class="form-control" id="fseb_${idx}" value="${fs.endTime||'17:00'}">
-    <select class="form-control" id="fsab_${idx}">${areaOpts}</select>
-    <button class="btn btn-danger btn-sm btn-icon" type="button" onclick="rmFsBRow('${idx}')">×</button>
+    <div class="fs-row-top">
+      <select class="form-control" id="fsdb_${idx}">${dayOpts}</select>
+      <div style="display:flex;gap:14px;align-items:center">
+        <label class="check-item" style="font-size:12px"><input type="radio" name="fstypeb_${idx}" value="continuous" ${!isSplit?'checked':''} onchange="toggleFsBType('${idx}','continuous')"> Continuato</label>
+        <label class="check-item" style="font-size:12px"><input type="radio" name="fstypeb_${idx}" value="split" ${isSplit?'checked':''} onchange="toggleFsBType('${idx}','split')"> Con pausa pranzo</label>
+      </div>
+      <button class="btn btn-danger btn-sm btn-icon" type="button" onclick="rmFsBRow('${idx}')">×</button>
+    </div>
+    <div id="fscontb_${idx}" ${isSplit?'style="display:none"':''}>
+      <div class="fs-times">
+        <div><div class="fs-label">Inizio</div><input type="time" class="form-control time-input" id="fssb_${idx}" value="${fs.startTime||'09:00'}"></div>
+        <span style="padding-top:16px;color:var(--muted)">–</span>
+        <div><div class="fs-label">Fine</div><input type="time" class="form-control time-input" id="fseb_${idx}" value="${fs.endTime||'17:00'}"></div>
+        <div style="flex:1"><div class="fs-label">Area</div><select class="form-control" id="fsab_${idx}">${areaOpts}</select></div>
+      </div>
+    </div>
+    <div id="fssplitb_${idx}" ${!isSplit?'style="display:none"':''}>
+      <div class="fs-split-row">
+        <div>
+          <div class="fs-label">🌅 Mattina</div>
+          <div class="fs-times">
+            <input type="time" class="form-control time-input" id="fssb1_${idx}" value="${fs.startTime||'09:00'}" style="width:100px">
+            <span style="color:var(--muted)">–</span>
+            <input type="time" class="form-control time-input" id="fseb1_${idx}" value="${fs.endTime||'13:00'}" style="width:100px">
+          </div>
+          <select class="form-control mt-4" id="fsab1_${idx}">${areaOpts}</select>
+        </div>
+        <div>
+          <div class="fs-label">🌆 Pomeriggio</div>
+          <div class="fs-times">
+            <input type="time" class="form-control time-input" id="fssb2_${idx}" value="${fs.startTime2||'15:30'}" style="width:100px">
+            <span style="color:var(--muted)">–</span>
+            <input type="time" class="form-control time-input" id="fseb2_${idx}" value="${fs.endTime2||'19:30'}" style="width:100px">
+          </div>
+          <select class="form-control mt-4" id="fsab2_${idx}">${areaOpts2||areaOpts}</select>
+        </div>
+      </div>
+    </div>
   </div>`;
 }
-function addFsBRow(){_fsBIdx++;const c=document.getElementById('fsBRows');const d=document.createElement('div');d.innerHTML=buildFsBRow({day:'mon',startTime:'09:00',endTime:'17:00',areaId:(S.areas[0]||{}).id||''},'n'+_fsBIdx);c.appendChild(d.firstElementChild)}
+function toggleFsBType(idx,type){
+  document.getElementById('fscontb_'+idx).style.display=type==='split'?'none':'';
+  document.getElementById('fssplitb_'+idx).style.display=type==='split'?'':'none';
+}
+function addFsBRow(){
+  _fsBIdx++;
+  const c=document.getElementById('fsBRows');
+  const d=document.createElement('div');
+  d.innerHTML=buildFsBRow({day:'mon',type:'continuous',startTime:'09:00',endTime:'17:00',areaId:(S.areas[0]||{}).id||''},'n'+_fsBIdx);
+  c.appendChild(d.firstElementChild);
+}
 function rmFsBRow(idx){const r=document.getElementById(`fsrb_${idx}`);if(r)r.remove()}
+function collectFs(){
+  return Array.from(document.querySelectorAll('#fsRows .fs-row')).map(row=>{
+    const i=row.id.replace('fsr_','');
+    const typeEl=document.querySelector(`input[name="fstype_${i}"]:checked`);
+    const type=typeEl?typeEl.value:'continuous';
+    if(type==='split'){
+      // split: mattina usa fss1_/fse1_/fsa1_, pomeriggio usa fss2_/fse2_/fsa2_
+      return {
+        day:document.getElementById(`fsd_${i}`).value,
+        type:'split',
+        startTime:(document.getElementById(`fss1_${i}`)||{value:'09:00'}).value||'09:00',
+        endTime:(document.getElementById(`fse1_${i}`)||{value:'13:00'}).value||'13:00',
+        areaId:(document.getElementById(`fsa1_${i}`)||{value:''}).value||'',
+        startTime2:(document.getElementById(`fss2_${i}`)||{value:'15:30'}).value||'15:30',
+        endTime2:(document.getElementById(`fse2_${i}`)||{value:'19:30'}).value||'19:30',
+        areaId2:(document.getElementById(`fsa2_${i}`)||{value:''}).value||''
+      };
+    } else {
+      // continuato: usa fss_/fse_/fsa_
+      return {
+        day:document.getElementById(`fsd_${i}`).value,
+        type:'continuous',
+        startTime:document.getElementById(`fss_${i}`).value,
+        endTime:document.getElementById(`fse_${i}`).value,
+        areaId:document.getElementById(`fsa_${i}`).value
+      };
+    }
+  });
+}
 function collectFsB(){
   return Array.from(document.querySelectorAll('#fsBRows .fs-row')).map(row=>{
     const i=row.id.replace('fsrb_','');
-    return {day:document.getElementById(`fsdb_${i}`).value,startTime:document.getElementById(`fssb_${i}`).value,endTime:document.getElementById(`fseb_${i}`).value,areaId:document.getElementById(`fsab_${i}`).value};
+    const typeEl=document.querySelector(`input[name="fstypeb_${i}"]:checked`);
+    const type=typeEl?typeEl.value:'continuous';
+    if(type==='split'){
+      return {
+        day:document.getElementById(`fsdb_${i}`).value,
+        type:'split',
+        startTime:(document.getElementById(`fssb1_${i}`)||{value:'09:00'}).value||'09:00',
+        endTime:(document.getElementById(`fseb1_${i}`)||{value:'13:00'}).value||'13:00',
+        areaId:(document.getElementById(`fsab1_${i}`)||{value:''}).value||'',
+        startTime2:(document.getElementById(`fssb2_${i}`)||{value:'15:30'}).value||'15:30',
+        endTime2:(document.getElementById(`fseb2_${i}`)||{value:'19:30'}).value||'19:30',
+        areaId2:(document.getElementById(`fsab2_${i}`)||{value:''}).value||''
+      };
+    } else {
+      return {
+        day:document.getElementById(`fsdb_${i}`).value,
+        type:'continuous',
+        startTime:document.getElementById(`fssb_${i}`).value,
+        endTime:document.getElementById(`fseb_${i}`).value,
+        areaId:document.getElementById(`fsab_${i}`).value
+      };
+    }
   });
 }
 function toggleBiweekly(){
@@ -2077,12 +2231,6 @@ function toggleBiweekly(){
 }
 function toggleHT(type){document.getElementById('htCustom').style.display=type==='custom'?'':'none';document.getElementById('htFixed').style.display=type==='fixed'?'':'none'}
 
-function collectFs(){
-  return Array.from(document.querySelectorAll('#fsRows .fs-row')).map(row=>{
-    const i=row.id.replace('fsr_','');
-    return {day:document.getElementById(`fsd_${i}`).value,startTime:document.getElementById(`fss_${i}`).value,endTime:document.getElementById(`fse_${i}`).value,areaId:document.getElementById(`fsa_${i}`).value};
-  });
-}
 function collectVacations(){
   return Array.from(document.querySelectorAll('#vacRows .vac-row')).map(row=>{
     const i=row.id.replace('vr_','');
@@ -2179,9 +2327,14 @@ function refreshEmpSchedule(empId){
       effectiveSch.forEach(fs=>{
         const dk=fs.day;
         if(!sch.days[dk]||!S.storeHours[dk]||!S.storeHours[dk].open)return;
-        sch.days[dk].shifts.push({employeeId:empId,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:shiftH(fs.startTime,fs.endTime)});
+        if(fs.type==='split'&&fs.startTime2&&fs.endTime2){
+          sch.days[dk].shifts.push({employeeId:empId,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:shiftH(fs.startTime,fs.endTime)});
+          sch.days[dk].shifts.push({employeeId:empId,startTime:fs.startTime2,endTime:fs.endTime2,areaId:fs.areaId2||fs.areaId||'',hours:shiftH(fs.startTime2,fs.endTime2)});
+        } else {
+          sch.days[dk].shifts.push({employeeId:empId,startTime:fs.startTime,endTime:fs.endTime,areaId:fs.areaId||'',hours:shiftH(fs.startTime,fs.endTime)});
+        }
       });
-      const workedDays=effectiveSch.map(fs=>fs.day);
+      const workedDays=[...new Set(effectiveSch.map(fs=>fs.day))];
       let restDay;
       if(emp.isDirectore&&openDays.includes('sun')){
         restDay='sun';
