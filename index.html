@@ -1703,23 +1703,25 @@ function saveShiftEdit(empId,dayKey,weekIdx){
 /* ═══════════════ ASSENZA URGENTE ═══════════════ */
 function openEmergencyModal(){
   if(!S.weekSchedules.length){toast('Nessun orario generato');return}
+  // BUG4-guard: non aprire su archivio (già gestito da emergencyBtn display, ma doppio check)
+  if(S.currentViewSource!=='current'){toast('Funzione disponibile solo sull\'orario corrente');return}
   const idx=S.currentViewWeekIdx;
   const sch=S.weekSchedules[idx];
   const ws=new Date(sch.weekStart+'T00:00:00');
 
-  // Build employee options (those not on vacation)
   const empOpts=S.employees
     .filter(e=>!isOnVacation(e,sch.weekStart))
     .map(e=>`<option value="${e.id}">${esc(e.name)}</option>`).join('');
 
-  // Build open day options for this week
   const dayOpts=DAYS_KEY.map((k,i)=>{
     const sh=S.storeHours[k];if(!sh||!sh.open)return '';
     const date=isoDate(addDays(ws,i));
     return `<option value="${k}|${date}">${DAYS_FULL[i]} (${fmtShort(addDays(ws,i))})</option>`;
   }).filter(Boolean).join('');
 
+  // BUG1: verifica che ci siano opzioni valide
   if(!empOpts){toast('Nessun dipendente disponibile questa settimana');return}
+  if(!dayOpts){toast('Nessun giorno aperto questa settimana');return}
 
   openModal(`
     <div class="modal-header">
@@ -1746,7 +1748,7 @@ function openEmergencyModal(){
         <div class="check-group mt-4">
           <label class="check-item"><input type="radio" name="absType" value="malattia" checked> 🤒 Malattia</label>
           <label class="check-item"><input type="radio" name="absType" value="permesso"> 🗓 Permesso</label>
-          <label class="check-item"><input type="radio" name="absType" value="ferie"> 🏖 Ferie improvvise</label>
+          <label class="check-item"><input type="radio" name="absType" value="ferie"> 🏖 Ferie (giorno singolo)</label>
         </div>
       </div>
       <div id="emergInfo"></div>
@@ -1768,31 +1770,33 @@ function refreshEmergencyInfo(){
   const sch=S.weekSchedules[idx];
   const dayData=sch.days[dayKey];
   const dayIdx=DAYS_KEY.indexOf(dayKey);
-  const ws=new Date(sch.weekStart+'T00:00:00');
 
-  // Shifts being removed
   const removedShifts=(dayData&&dayData.shifts||[]).filter(s=>s.employeeId===empId);
   const removedAreas=removedShifts.map(s=>{const a=getArea(s.areaId);return a?a.name:'—'});
 
-  // Who else is working that day (excluding absent employee)
-  const workingOthers=S.employees.filter(e=>{
-    if(e.id===empId)return false;
-    if(isOnVacation(e,sch.weekStart))return false;
-    if((e.daysOff||[]).includes(dayDate))return false;
-    if((e.permissionDays||[]).includes(dayDate))return false;
-    if(dayData&&dayData.dayOff&&dayData.dayOff.includes(e.id))return false;
-    return true;
-  });
-
-  const sh=S.storeHours[dayKey];
   const el=document.getElementById('emergInfo');
   if(!removedShifts.length){
     el.innerHTML=`<div class="alert alert-info">Questo dipendente non ha turni assegnati il ${DAYS_FULL[dayIdx]}.</div>`;
     return;
   }
 
-  const empOpts=(idx)=>S.employees
-    .filter(e=>e.id!==empId&&!isOnVacation(e,sch.weekStart)&&!(dayData&&dayData.dayOff&&dayData.dayOff.includes(e.id))&&!(e.daysOff||[]).includes(dayDate))
+  // BUG5+BUG7: escludi l'assente, chi è in ferie/assenza, chi ha già un turno sovrapposto
+  const buildSubstOpts=(shift)=>S.employees
+    .filter(e=>{
+      if(e.id===empId)return false; // BUG7: no auto-sostituzione
+      if(isOnVacation(e,sch.weekStart))return false;
+      if((e.daysOff||[]).includes(dayDate))return false;
+      if((e.permissionDays||[]).includes(dayDate))return false;
+      if(dayData&&dayData.dayOff&&dayData.dayOff.includes(e.id))return false;
+      // BUG5: escludi chi ha già un turno sovrapposto con questo orario
+      const hasOverlap=(dayData.shifts||[]).some(s=>
+        s.employeeId===e.id&&
+        t2m(s.startTime)<t2m(shift.endTime)&&
+        t2m(s.endTime)>t2m(shift.startTime)
+      );
+      if(hasOverlap)return false;
+      return true;
+    })
     .map(e=>`<option value="${e.id}">${esc(e.name)}</option>`).join('');
 
   el.innerHTML=`
@@ -1803,6 +1807,7 @@ function refreshEmergencyInfo(){
     ${removedShifts.map((s,i)=>{
       const area=getArea(s.areaId);
       const color=area?area.color:'#3498DB';
+      const substOpts=buildSubstOpts(s);
       return `<div class="uncover-row">
         <div class="uncover-area">
           <span style="width:10px;height:10px;background:${color};border-radius:2px;display:inline-block"></span>
@@ -1812,55 +1817,69 @@ function refreshEmergencyInfo(){
         <div>
           <select class="form-control" id="cover_${i}" style="font-size:12px">
             <option value="">— Nessun sostituto —</option>
-            ${empOpts(i)}
+            ${substOpts||'<option disabled>Nessun dipendente disponibile</option>'}
           </select>
         </div>
       </div>`;
     }).join('')}
-    <div style="font-size:11px;color:var(--muted);margin-top:8px">💡 I sostituti assegnati prenderanno lo stesso orario del turno scoperto.</div>`;
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">💡 I sostituti assegnati prenderanno lo stesso orario del turno scoperto. Sono esclusi dipendenti con turni sovrapposti.</div>`;
 }
 
 function applyEmergency(weekIdx){
   const empId=document.getElementById('emergEmp').value;
   const dayVal=document.getElementById('emergDay').value;
   if(!empId||!dayVal){toast('Seleziona dipendente e giorno');return}
+  // Guard: solo orario corrente, non archivio
+  if(S.currentViewSource!=='current'){toast('Non modificabile: orario in archivio');return}
+  if(!S.weekSchedules[weekIdx]){toast('Settimana non trovata');return}
+
   const[dayKey,dayDate]=dayVal.split('|');
   const absType=document.querySelector('input[name="absType"]:checked')?.value||'malattia';
 
   const sch=S.weekSchedules[weekIdx];
   const dayData=sch.days[dayKey];
-  const removedShifts=(dayData&&dayData.shifts||[]).filter(s=>s.employeeId===empId);
+  if(!dayData){toast('Dati giorno non trovati');return}
 
-  // Remove shifts of absent employee
+  const removedShifts=(dayData.shifts||[]).filter(s=>s.employeeId===empId);
+
+  // Rimuovi turni dipendente assente
   dayData.shifts=dayData.shifts.filter(s=>s.employeeId!==empId);
-  // Add to dayOff
   if(!dayData.dayOff.includes(empId))dayData.dayOff.push(empId);
 
-  // Add to employee's absence/permission days
+  // Registra assenza sul dipendente (BUG3: ferie giorno singolo → daysOff come malattia)
   const emp=getEmp(empId);
   if(emp){
     if(absType==='permesso'){
       if(!emp.permissionDays)emp.permissionDays=[];
       if(!emp.permissionDays.includes(dayDate))emp.permissionDays.push(dayDate);
     } else {
+      // malattia e ferie giorno singolo → daysOff
       if(!emp.daysOff)emp.daysOff=[];
       if(!emp.daysOff.includes(dayDate))emp.daysOff.push(dayDate);
     }
   }
 
-  // Assign substitutes
+  // Assegna sostituti (BUG7: no auto-sostituzione)
   removedShifts.forEach((s,i)=>{
     const substId=document.getElementById(`cover_${i}`)?.value;
-    if(substId){
-      // Remove substitute from dayOff if they were resting (extend their day)
+    if(substId&&substId!==empId){
+      // Rimuovi sostituto da dayOff se era in riposo
       dayData.dayOff=dayData.dayOff.filter(id=>id!==substId);
-      // Add substitute shift
-      dayData.shifts.push({employeeId:substId,startTime:s.startTime,endTime:s.endTime,areaId:s.areaId,hours:shiftH(s.startTime,s.endTime)});
+      // Aggiungi turno sostituto
+      dayData.shifts.push({
+        employeeId:substId,
+        startTime:s.startTime,
+        endTime:s.endTime,
+        areaId:s.areaId,
+        hours:shiftH(s.startTime,s.endTime),
+        isSubstitute:true // flag per eventuale visualizzazione futura
+      });
     }
   });
 
   save();closeModal();renderSchedule();renderEmployees();
-  toast('Assenza registrata e coperture assegnate ✓');
+  const absLabel=absType==='permesso'?'Permesso':absType==='ferie'?'Ferie':'Malattia';
+  toast(`${absLabel} registrata per ${emp?emp.name:'dipendente'} ✓`);
 }
 
 /* ═══════════════ EMPLOYEE MODAL ═══════════════ */
