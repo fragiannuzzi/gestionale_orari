@@ -195,7 +195,7 @@ textarea.form-control{resize:vertical;min-height:64px}
   </div>
 </div>
 
-<div id="loadingOverlay">
+<div id="loadingOverlay" style="display:none">
   <div class="spinner"></div>
   <div style="font-size:13px;color:var(--muted);font-weight:600">Caricamento dati dal cloud...</div>
 </div>
@@ -261,7 +261,6 @@ textarea.form-control{resize:vertical;min-height:64px}
       </table>
     </div>
   </div>
-</div>
 
   <div class="card" style="margin-top:16px">
     <div class="card-header"><div class="card-title">Vincoli di Presenza</div></div>
@@ -331,6 +330,7 @@ textarea.form-control{resize:vertical;min-height:64px}
         <ul style="margin-top:6px;padding-left:18px;line-height:1.9;font-size:12px">
           <li><strong>Priorità 1 — Copertura settimana completa</strong> (inclusa domenica) per tutti i giorni di apertura</li>
           <li><strong>Priorità 2 — Contemporaneità per area</strong>: Magazzino-Vendita è sacrificabile in caso di carenza personale</li>
+          <li><strong>Domenica: esattamente 3 persone</strong>, turno completo (apertura→chiusura), a rotazione settimanale — non sempre le stesse 3</li>
           <li>Chi inizia alle 07:00 (camion) deve fare <strong>almeno fino alle 11:00</strong> (min. 4h)</li>
           <li>Turno spezzato: max 6h consecutive, poi pausa obbligatoria ≥ 2h</li>
           <li>1 giorno di riposo settimanale per dipendente, a rotazione</li>
@@ -603,8 +603,6 @@ async function changePasswordModal() {
   else { err.textContent = 'Errore aggiornamento — riprova'; }
 }
 
-
-
 function setSyncStatus(s){
   const el=document.getElementById('syncStatus');if(!el)return;
   if(s==='saving'){el.textContent='⏳ Salvataggio...';el.style.color='var(--muted)'}
@@ -862,7 +860,53 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     if(restDay&&!sch.days[restDay].dayOff.includes(emp.id))sch.days[restDay].dayOff.push(emp.id);
   });
 
+  // ── DOMENICA: max 3 persone, turno completo, rotazione settimanale ──
+  // Logica:
+  //  1. Se domenica è aperta, seleziona esattamente 3 flex emp a rotazione
+  //     (usando weekIndex come seed di rotazione, penalizzando chi ha già lavorato domenica di recente)
+  //  2. Chi NON è tra i 3 va in dayOff domenica
+  //  3. I 3 selezionati faranno turno COMPLETO (apertura→chiusura) gestito in openDays.forEach
+  const SUN_WORKERS=3; // numero fisso domenica
+  const sunWorkerIds=new Set(); // empId dei 3 che lavorano domenica
+  const sundayOpen=openDays.includes('sun')&&S.storeHours['sun']&&S.storeHours['sun'].open;
+
+  if(sundayOpen){
+    // Candidati domenica: flex emp non in ferie, non con dayOff fisso domenica
+    const sunDate=isoDate(addDays(weekStart,6)); // domenica è index 6
+    const sunCandidates=flexEmps.filter(emp=>{
+      if(emp.isDirectore)return false; // direttore sempre libero domenica
+      if((emp.daysOff||[]).includes(sunDate))return false;
+      if((emp.permissionDays||[]).includes(sunDate))return false;
+      return true;
+    });
+
+    // Rotazione: ordina i candidati per "chi ha riposato domenica più di recente"
+    // Usiamo sunRestHistory passato come parametro (vedi doGenerate)
+    // In assenza, usiamo weekIndex per ruotare ciclicamente
+    const sorted=[...sunCandidates].sort((a,b)=>{
+      // Penalizza chi ha lavorato domenica la settimana scorsa (sunLastWorked)
+      const lastA=restHistory['sun_'+a.id]||(-1);
+      const lastB=restHistory['sun_'+b.id]||(-1);
+      // Chi ha lavorato domenica più di recente va in fondo
+      if(lastA!==lastB)return lastA-lastB;
+      // Parità: ruota per weekIndex usando posizione nell'array
+      return sunCandidates.indexOf(a)-sunCandidates.indexOf(b);
+    });
+
+    // Prendi i primi SUN_WORKERS
+    const chosen=sorted.slice(0,Math.min(SUN_WORKERS,sorted.length));
+    chosen.forEach(e=>sunWorkerIds.add(e.id));
+
+    // Tutti i flex non scelti → dayOff domenica
+    flexEmps.forEach(emp=>{
+      if(!sunWorkerIds.has(emp.id)&&!sch.days['sun'].dayOff.includes(emp.id)){
+        sch.days['sun'].dayOff.push(emp.id);
+      }
+    });
+  }
+
   // Assign rest days for flex employees — ROTATING
+  // (domenica già gestita sopra per i non-selezionati)
   const restCount={};
   openDays.forEach(d=>{restCount[d]=0});
   avail.forEach(e=>{
@@ -874,14 +918,23 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     let chosen;
     if(emp.isDirectore&&openDays.includes('sun')){
       chosen='sun';
+    } else if(sundayOpen&&!sunWorkerIds.has(emp.id)){
+      // Già messo in dayOff domenica — trova un altro giorno di riposo tra lun-sab
+      // (ha già il riposo domenica, ma ne serve uno anche infrasettimanale se contratto lo richiede)
+      // In realtà la domenica È il suo giorno di riposo settimanale
+      // Non assegnare un secondo riposo — la domenica conta come riposo
+      return; // già gestito sopra
     } else {
-      const sorted=[...openDays].sort((a,b)=>{
+      // Lavoratori domenica o giorni normali: assegna riposo rotante lun-sab
+      const weekdaysOnly=openDays.filter(d=>d!=='sun');
+      const pool=weekdaysOnly.length>0?weekdaysOnly:openDays;
+      const sorted2=[...pool].sort((a,b)=>{
         const penA=(a===lastRest?100:0)+(restCount[a]||0);
         const penB=(b===lastRest?100:0)+(restCount[b]||0);
         if(penA!==penB)return penA-penB;
         return restPref.indexOf(a)-restPref.indexOf(b);
       });
-      chosen=sorted[0];
+      chosen=sorted2[0];
     }
     if(chosen&&!sch.days[chosen].dayOff.includes(emp.id)){
       sch.days[chosen].dayOff.push(emp.id);
@@ -955,7 +1008,40 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return;
     }
 
-    // ── a) CAMION 07:00 con regola minimo fino alle 11:00 ──
+    // ── DOMENICA: turno completo per i 3 selezionati ──
+    // I 3 lavoratori domenicali fanno un unico turno dall'apertura alla chiusura
+    // senza spezzato. Non si applica coverPeriod/fillHours normali.
+    if(dayKey==='sun'&&sundayOpen&&sunWorkerIds.size>0){
+      const sh_sun=S.storeHours['sun'];
+      // Orario completo: dall'apertura mattina alla chiusura pomeriggio (o sera se continuato)
+      const sunStart=sh_sun.ms;
+      const sunEnd=sh_sun.ae;
+      const sunH=shiftH(sunStart,sunEnd);
+      // Area: distribuisci i 3 su aree diverse se possibile
+      const sunAreas=[...nonMagAreas,...magAreas];
+      let areaIdx=0;
+      working.filter(emp=>sunWorkerIds.has(emp.id)).forEach(emp=>{
+        const area=sunAreas[areaIdx%sunAreas.length]||sunAreas[0];
+        areaIdx++;
+        sch.days['sun'].shifts.push({
+          employeeId:emp.id,
+          startTime:sunStart,
+          endTime:sunEnd,
+          areaId:area?area.id:'',
+          hours:sunH,
+          sundayFull:true
+        });
+        worked[emp.id]=(worked[emp.id]||0)+sunH;
+      });
+      // Segna domenica come lavorata per rotazione futura
+      sunWorkerIds.forEach(id=>{restHistory['sun_'+id]=weekIndex});
+      // Avviso se meno di 3 disponibili
+      const actualSun=working.filter(emp=>sunWorkerIds.has(emp.id)).length;
+      if(actualSun<SUN_WORKERS){
+        warnings.push(`Domenica (${weekRange(weekStartISO)}): solo ${actualSun} su ${SUN_WORKERS} lavoratori disponibili`);
+      }
+      return; // domenica gestita — salta coverPeriod e fillHours normali
+    }
     const isCamionDay=!!(S.camionDays&&S.camionDays[dayKey]);
     if(isCamionDay&&magAreas.length&&t2m(sh.ms)>t2m('07:00')){
       const camEmp=working.find(e=>e.takesMorningDelivery);
@@ -1437,7 +1523,8 @@ function renderSchedule(){
       const shiftsHtml=shifts.map(s=>{
         const area=getArea(s.areaId);const color=area?area.color:'#3498DB';
         const otBadge=s.overtime?'<div class="badge-ot">📌 STRAORDINARIO</div>':'';
-        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}</div>`;
+        const sunBadge=s.sundayFull?'<div class="badge-ot" style="background:#D6EAF8;color:#1B4F72">☀️ Turno domenica</div>':'';
+        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}${sunBadge}</div>`;
       }).join('');
 
       html+=`<td><div class="day-cell" ${clickFn} style="${cursor}" ${!isReadOnly?'title="Clicca per modificare"':''}>${shiftsHtml}</div></td>`;
@@ -2120,6 +2207,8 @@ function renderAll(){renderEmployees();renderAreas();document.getElementById('st
   const overlay=document.getElementById('loadingOverlay');
   // Auth check first — blocks UI until password verified
   await authInit();
+  // Show loading indicator while fetching from cloud
+  overlay.style.display='flex';
   // Try Supabase first; fall back to localStorage if offline/empty
   const fromCloud=await loadFromSupabase();
   if(!fromCloud)load();
