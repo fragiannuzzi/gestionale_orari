@@ -162,9 +162,38 @@ textarea.form-control{resize:vertical;min-height:64px}
 .spinner{width:40px;height:40px;border:4px solid #D6E4F0;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 #syncStatus{font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;transition:opacity .3s}
+/* ── AUTH SCREEN ── */
+#authOverlay{position:fixed;inset:0;background:var(--primary);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px}
+.auth-box{background:#fff;border-radius:12px;padding:40px 36px;width:100%;max-width:360px;box-shadow:0 24px 64px rgba(0,0,0,.35);text-align:center}
+.auth-logo{font-size:44px;margin-bottom:10px}
+.auth-title{font-size:20px;font-weight:700;color:var(--primary);margin-bottom:4px}
+.auth-sub{font-size:13px;color:var(--muted);margin-bottom:24px}
+.auth-box input[type=password]{width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:6px;font-size:15px;font-family:var(--font);outline:none;margin-bottom:14px;transition:border-color 120ms}
+.auth-box input[type=password]:focus{border-color:var(--accent)}
+.auth-btn{width:100%;padding:11px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;font-family:var(--font);transition:background 120ms}
+.auth-btn:hover{background:#1A6FA8}
+.auth-err{color:var(--danger);font-size:12px;margin-top:8px;min-height:18px;font-weight:600}
+.auth-change{font-size:11px;color:var(--muted);margin-top:14px;cursor:pointer;text-decoration:underline}
+.auth-change:hover{color:var(--accent)}
+/* ── STRAORDINARI BADGE ── */
+.shift-chip.overtime{border-left-color:#E67E22;background:#FEF0E0}
+.badge-ot{background:#FDEBD0;color:#784212;font-size:10px;font-weight:700;padding:1px 5px;border-radius:8px;display:inline-block;margin-top:2px}
 </style>
 </head>
 <body>
+
+<!-- ── AUTH SCREEN ── -->
+<div id="authOverlay" style="display:none">
+  <div class="auth-box">
+    <div class="auth-logo">🏪</div>
+    <div class="auth-title">Gestionale Orari</div>
+    <div class="auth-sub" id="authSubTitle">Accesso riservato</div>
+    <input type="text" id="authUsernameInput" placeholder="Username" autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('authPwdInput').focus()" style="width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:6px;font-size:15px;font-family:var(--font);outline:none;margin-bottom:10px;transition:border-color 120ms" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+    <input type="password" id="authPwdInput" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')authSubmit()">
+    <button class="auth-btn" onclick="authSubmit()" id="authBtnMain">Accedi</button>
+    <div class="auth-err" id="authErr"></div>
+  </div>
+</div>
 
 <div id="loadingOverlay">
   <div class="spinner"></div>
@@ -175,7 +204,7 @@ textarea.form-control{resize:vertical;min-height:64px}
   <span style="font-size:22px">🏪</span>
   <div class="app-title">Gestionale Orari</div>
   <div class="app-sub" id="storeNameHdr">Acqua &amp; Sapone</div>
-  <div style="margin-left:auto"><span id="syncStatus"></span></div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:12px"><span id="syncStatus"></span><button onclick="authLogout()" style="background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.3);color:#fff;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer;font-family:var(--font)" title="Esci">🔓 Esci</button></div>
 </div>
 
 <div class="nav" id="navTabs">
@@ -300,12 +329,14 @@ textarea.form-control{resize:vertical;min-height:64px}
       <div class="info-box mb-16">
         <strong>Regole applicate automaticamente:</strong>
         <ul style="margin-top:6px;padding-left:18px;line-height:1.9;font-size:12px">
-          <li>Tutte le aree coperte per tutta la giornata (mattina e pomeriggio) — eccezione: Magazzino-Vendita può restare scoperto</li>
-          <li>Possibile turno spezzato (mattina + pomeriggio) se necessario per la copertura</li>
+          <li><strong>Priorità 1 — Copertura settimana completa</strong> (inclusa domenica) per tutti i giorni di apertura</li>
+          <li><strong>Priorità 2 — Contemporaneità per area</strong>: Magazzino-Vendita è sacrificabile in caso di carenza personale</li>
+          <li>Chi inizia alle 07:00 (camion) deve fare <strong>almeno fino alle 11:00</strong> (min. 4h)</li>
+          <li>Turno spezzato: max 6h consecutive, poi pausa obbligatoria ≥ 2h</li>
           <li>1 giorno di riposo settimanale per dipendente, a rotazione</li>
-          <li>Rispetto ore contrattuali settimanali — senza limite fisso giornaliero</li>
+          <li>Rispetto ore contrattuali settimanali</li>
+          <li>Se le ore contrattuali non bastano a coprire la settimana → <strong>straordinari distribuiti equamente</strong> e segnalati in arancione</li>
           <li>Specializzato profumeria → assegnato prioritariamente in Profumeria</li>
-          <li>Camion → turno dalle 07:00 nei giorni configurati, almeno fino all'apertura</li>
           <li>Periodi ferie rispettati automaticamente</li>
         </ul>
       </div>
@@ -327,7 +358,7 @@ textarea.form-control{resize:vertical;min-height:64px}
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Dipendente</th><th>Ore Contratto</th><th>Ore Assegnate</th><th>Stato</th><th>Giorno Riposo</th></tr></thead>
+        <thead><tr><th>Dipendente</th><th>Ore Contratto</th><th>Ore Assegnate</th><th>Straordinari</th><th>Stato</th><th>Giorno Riposo</th></tr></thead>
         <tbody id="genPreviewBody"></tbody>
       </table>
     </div>
@@ -376,6 +407,7 @@ textarea.form-control{resize:vertical;min-height:64px}
       </div>
       <div class="divider"></div>
       <div class="btn-group">
+        <button class="btn btn-secondary btn-sm" onclick="authShowChangeInline()">🔑 Cambia Password</button>
         <button class="btn btn-danger btn-sm" onclick="resetAll()">⚠️ Reset Tutti i Dati</button>
         <button class="btn btn-secondary btn-sm" onclick="exportData()">⬇ Esporta JSON</button>
         <button class="btn btn-secondary btn-sm" onclick="document.getElementById('importFile').click()">⬆ Importa JSON</button>
@@ -437,7 +469,141 @@ let S = defaultState();
 /* ═══════════════ SUPABASE ═══════════════ */
 const SB_URL='https://mmsjuoctkvyibleithvp.supabase.co';
 const SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1tc2p1b2N0a3Z5aWJsZWl0aHZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzOTk1ODIsImV4cCI6MjA5Nzk3NTU4Mn0.5EzcLLeBTk8Dm7B3iHFrxsQWCxEeam-4aFKBlV3BHH4';
-const SB_HDR={'Content-Type':'application/json','apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY};
+// Token segreto — deve coincidere con il valore in app_config su Supabase.
+// Anche se visibile nel sorgente HTML, senza questo token le RLS bloccano
+// l'accesso a app_state. Chi non conosce username+password non arriva mai qui.
+const APP_TOKEN='edd32d36efff0fde8ddd9116a06f0a14';
+// SB_HDR base (solo per login — non include ancora APP_TOKEN)
+const SB_HDR_BASE={'Content-Type':'application/json','apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY};
+// SB_HDR completo (con token) — usato per app_state dopo login riuscito
+let SB_HDR={...SB_HDR_BASE,'x-app-token':APP_TOKEN};
+
+/* ═══════════════ AUTH (Supabase-based) ═══════════════ */
+// Flusso:
+//  1. Login → SHA-256(password) → SELECT da app_users dove pwd_hash = $hash
+//  2. Se trovato → salva username in sessionStorage, sblocca UI
+//  3. Tutti i salvataggi su app_state passano header x-app-token (segreto lato Supabase via RLS)
+// La password non è mai in chiaro nel browser né in localStorage.
+
+const AUTH_SESSION = 'gest_auth_user'; // sessionStorage key
+
+async function sha256(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+async function authInit() {
+  const saved = sessionStorage.getItem(AUTH_SESSION);
+  if (saved) { hideAuthOverlay(); return; }
+  showAuthOverlay();
+}
+
+function showAuthOverlay(msg) {
+  const ov = document.getElementById('authOverlay');
+  ov.style.display = 'flex';
+  if (msg) document.getElementById('authErr').textContent = msg;
+  else document.getElementById('authErr').textContent = '';
+  document.getElementById('authPwdInput').value = '';
+  document.getElementById('authUsernameInput').value = '';
+  setTimeout(() => document.getElementById('authUsernameInput').focus(), 80);
+}
+
+function hideAuthOverlay() {
+  document.getElementById('authOverlay').style.display = 'none';
+}
+
+async function authSubmit() {
+  const username = document.getElementById('authUsernameInput').value.trim().toLowerCase();
+  const password = document.getElementById('authPwdInput').value;
+  const errEl = document.getElementById('authErr');
+  const btn = document.getElementById('authBtnMain');
+  errEl.textContent = '';
+  if (!username || !password) { errEl.textContent = 'Inserisci username e password'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Verifica in corso...';
+  try {
+    const hash = await sha256(password);
+    const res = await fetch(
+      SB_URL + '/rest/v1/app_users?username=eq.' + encodeURIComponent(username) + '&pwd_hash=eq.' + hash + '&select=username',
+      { headers: SB_HDR_BASE }
+    );
+    if (!res.ok) throw new Error('network');
+    const rows = await res.json();
+    if (rows.length > 0) {
+      sessionStorage.setItem(AUTH_SESSION, username);
+      hideAuthOverlay();
+    } else {
+      errEl.textContent = 'Credenziali non valide';
+    }
+  } catch(e) {
+    errEl.textContent = 'Errore di connessione — riprova';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Accedi';
+}
+
+function authLogout() {
+  sessionStorage.removeItem(AUTH_SESSION);
+  location.reload();
+}
+
+function authShowChangeInline() {
+  const currentUser = sessionStorage.getItem(AUTH_SESSION);
+  if (!currentUser) { toast('Devi essere loggato'); return; }
+  openModal(`
+    <div class="modal-header"><div class="modal-title">🔑 Cambia Password</div><button class="modal-close" onclick="closeModal()">×</button></div>
+    <div class="modal-body">
+      <div class="alert alert-info" style="margin-bottom:14px">Le password sono salvate su Supabase come hash SHA-256. Utente: <strong>${esc(currentUser)}</strong></div>
+      <div class="form-group mb-12">
+        <label class="form-label">Password attuale</label>
+        <input type="password" class="form-control" id="cpOld" placeholder="Password corrente">
+      </div>
+      <div class="form-group mb-12">
+        <label class="form-label">Nuova password</label>
+        <input type="password" class="form-control" id="cpNew" placeholder="Min. 6 caratteri">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Conferma nuova password</label>
+        <input type="password" class="form-control" id="cpNew2" placeholder="Ripeti la nuova password">
+      </div>
+      <div class="auth-err" id="cpErr" style="margin-top:10px"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">Annulla</button>
+      <button class="btn btn-primary" onclick="changePasswordModal()">Salva Nuova Password</button>
+    </div>`);
+}
+
+async function changePasswordModal() {
+  const currentUser = sessionStorage.getItem(AUTH_SESSION);
+  const old = document.getElementById('cpOld').value;
+  const nw  = document.getElementById('cpNew').value;
+  const nw2 = document.getElementById('cpNew2').value;
+  const err = document.getElementById('cpErr');
+  err.textContent = '';
+  if (!old) { err.textContent = 'Inserisci la password attuale'; return; }
+  if (nw.length < 6) { err.textContent = 'Nuova password troppo corta (min. 6 caratteri)'; return; }
+  if (nw !== nw2) { err.textContent = 'Le password non coincidono'; return; }
+  // Verify old password
+  const oldHash = await sha256(old);
+  const check = await fetch(
+    SB_URL + '/rest/v1/app_users?username=eq.' + encodeURIComponent(currentUser) + '&pwd_hash=eq.' + oldHash + '&select=username',
+    { headers: SB_HDR_BASE }
+  );
+  const rows = await check.json();
+  if (!rows.length) { err.textContent = 'Password attuale errata'; return; }
+  // Update password
+  const newHash = await sha256(nw);
+  const upd = await fetch(
+    SB_URL + '/rest/v1/app_users?username=eq.' + encodeURIComponent(currentUser),
+    { method:'PATCH', headers:{...SB_HDR,'Prefer':'return=minimal'}, body: JSON.stringify({pwd_hash: newHash}) }
+  );
+  if (upd.ok) { closeModal(); toast('Password aggiornata ✓'); }
+  else { err.textContent = 'Errore aggiornamento — riprova'; }
+}
+
+
 
 function setSyncStatus(s){
   const el=document.getElementById('syncStatus');if(!el)return;
@@ -654,8 +820,9 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
   const sch={weekStart:weekStartISO,days:{}};
   DAYS_KEY.forEach(k=>{sch.days[k]={shifts:[],dayOff:[]}});
 
-  const worked={};
-  avail.forEach(e=>{worked[e.id]=0});
+  const worked={};        // ore lavorate correnti per dipendente
+  const overtimeH={};     // ore straordinarie per dipendente (inizia a 0)
+  avail.forEach(e=>{worked[e.id]=0;overtimeH[e.id]=0});
 
   const openDays=DAYS_KEY.filter(k=>S.storeHours[k]&&S.storeHours[k].open);
 
@@ -669,17 +836,13 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
   const flexEmps =avail.filter(e=>e.hoursType!=='fixed');
 
   fixedEmps.forEach(emp=>{
-    // Determine which schedule to use (A or B for biweekly)
     const hasBiweekly=emp.fixedScheduleB&&emp.fixedScheduleB.length>0;
     let activeSchedule=emp.fixedSchedule||[];
     if(hasBiweekly){
-      // biweeklyFirstWeek: 'A'|'B' — which schedule week 0 of this generation uses
       const startOffset=emp.biweeklyFirstWeek==='B'?1:0;
       const useB=(weekIndex+startOffset)%2===1;
       if(useB)activeSchedule=emp.fixedScheduleB;
     }
-
-    // Direttore con orario fisso: salta domenica anche se nel turno fisso
     const effectiveSchedule=emp.isDirectore?activeSchedule.filter(fs=>fs.day!=='sun'):activeSchedule;
     effectiveSchedule.forEach(fs=>{
       const dk=fs.day;
@@ -689,7 +852,6 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       worked[emp.id]=(worked[emp.id]||0)+h;
     });
     const workedDays=effectiveSchedule.map(fs=>fs.day);
-    // Direttore: forza domenica libera; altri: rotazione normale
     const lastRest=restHistory[emp.id];
     let restDay;
     if(emp.isDirectore&&openDays.includes('sun')){
@@ -700,17 +862,15 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     if(restDay&&!sch.days[restDay].dayOff.includes(emp.id))sch.days[restDay].dayOff.push(emp.id);
   });
 
-  // Assign rest days for flex employees — ROTATING (penalize last week's rest day)
+  // Assign rest days for flex employees — ROTATING
   const restCount={};
   openDays.forEach(d=>{restCount[d]=0});
   avail.forEach(e=>{
     DAYS_KEY.forEach(k=>{if(sch.days[k].dayOff.includes(e.id)&&S.storeHours[k]&&S.storeHours[k].open)restCount[k]=(restCount[k]||0)+1});
   });
-
   const restPref=['mon','tue','wed','thu','fri','sat','sun'];
   flexEmps.forEach(emp=>{
     const lastRest=restHistory[emp.id];
-    // Direttore: domenica sempre libera se il negozio è aperto domenica
     let chosen;
     if(emp.isDirectore&&openDays.includes('sun')){
       chosen='sun';
@@ -729,7 +889,53 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     }
   });
 
-  // Assign shifts for each open day — supports spezzato (two shifts per employee)
+  // ── HELPER: ore consecutive accumulate da empId fino a cursorM (catena senza gap ≥2h) ──
+  const consecHAt=(empId,cursorM,dayKey)=>{
+    const prevS=sch.days[dayKey].shifts
+      .filter(s=>s.employeeId===empId&&t2m(s.endTime)<=cursorM)
+      .sort((a,b)=>t2m(b.startTime)-t2m(a.startTime));
+    let mins=0,ref=cursorM;
+    for(const s of prevS){
+      if(ref-t2m(s.endTime)>=120)break;
+      mins+=t2m(s.endTime)-t2m(s.startTime);
+      ref=t2m(s.startTime);
+    }
+    return mins/60;
+  };
+
+  // ── PASSO 1: calcola deficit orario totale della settimana ──
+  // Confronta ore contrattuali totali flex vs slot-ora disponibili totali
+  const totalContractH=flexEmps.reduce((s,e)=>s+(empMaxH(e)||0),0);
+  const totalSlotH=openDays.reduce((s,dk)=>{
+    const sh=S.storeHours[dk];if(!sh)return s;
+    const mH=(t2m(sh.type==='split'?sh.me:sh.ae)-t2m(sh.ms))/60;
+    const aH=sh.type==='split'?(t2m(sh.ae)-t2m(sh.as))/60:0;
+    return s+(mH+aH)*Math.min(flexEmps.length,S.maxConcurrentTotal||flexEmps.length);
+  },0);
+  // stima ore necessarie a coprire minimo 1 persona per area per giorno aperto
+  const totalAreaCovH=openDays.reduce((s,dk)=>{
+    const sh=S.storeHours[dk];if(!sh)return s;
+    const dayH_val=sh.type==='split'?(t2m(sh.me)-t2m(sh.ms))/60+(t2m(sh.ae)-t2m(sh.as))/60:(t2m(sh.ae)-t2m(sh.ms))/60;
+    return s+dayH_val*S.areas.filter(a=>!a.name.toLowerCase().includes('magazzino')).length;
+  },0);
+  const deficit=Math.max(0,totalAreaCovH-totalContractH);
+  // distribuisci extra equamente tra flex emps (senza direttori?)
+  const otPerEmp=flexEmps.length>0?Math.ceil((deficit/flexEmps.length)*2)/2:0; // arrotonda a 0.5h
+  const extraBudget={}; // ore straordinarie aggiuntive per dipendente
+  if(otPerEmp>0){
+    flexEmps.forEach(e=>{extraBudget[e.id]=otPerEmp});
+  }
+
+  // ── PASSO 2: assegna turni giorno per giorno ──
+  // Strategia: prima riempi la settimana (priorità 1), poi ottimizza aree (priorità 2).
+  // Per ogni giorno aperto:
+  //   a) Camion 07:00 (con regola min 11:00)
+  //   b) coverPeriod: aree non-magazzino (obbligo), poi magazzino (sacrificabile)
+  //   c) fillHours: ore contrattuali residue + eventuali straordinari
+  const isMagArea=a=>a.name.toLowerCase().includes('magazzino');
+  const nonMagAreas=S.areas.filter(a=>!isMagArea(a));
+  const magAreas   =S.areas.filter(a=>isMagArea(a));
+
   openDays.forEach(dayKey=>{
     const dayIdx=DAYS_KEY.indexOf(dayKey);
     const sh=S.storeHours[dayKey];
@@ -749,41 +955,33 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return;
     }
 
-    const isMagArea=a=>a.name.toLowerCase().includes('magazzino');
-    const nonMagAreas=S.areas.filter(a=>!isMagArea(a));
-    const magAreas=S.areas.filter(a=>isMagArea(a));
-
-    // Ore consecutive accumulate da empId fino a cursorM (catena senza gap ≥2h)
-    const consecHAt=(empId,cursorM)=>{
-      const prevS=sch.days[dayKey].shifts
-        .filter(s=>s.employeeId===empId&&t2m(s.endTime)<=cursorM)
-        .sort((a,b)=>t2m(b.startTime)-t2m(a.startTime));
-      let mins=0,ref=cursorM;
-      for(const s of prevS){
-        if(ref-t2m(s.endTime)>=120)break; // gap ≥2h → catena interrotta
-        mins+=t2m(s.endTime)-t2m(s.startTime);
-        ref=t2m(s.startTime);
-      }
-      return mins/60;
-    };
-
-    // Camion: in giorni con consegna, l'addetto parte alle 07:00 in Magazzino fino all'apertura.
-    // Le altre aree NON devono essere presidiate prima dell'orario di apertura.
+    // ── a) CAMION 07:00 con regola minimo fino alle 11:00 ──
     const isCamionDay=!!(S.camionDays&&S.camionDays[dayKey]);
     if(isCamionDay&&magAreas.length&&t2m(sh.ms)>t2m('07:00')){
       const camEmp=working.find(e=>e.takesMorningDelivery);
       if(camEmp){
-        const camH=shiftH('07:00',sh.ms);
-        sch.days[dayKey].shifts.push({employeeId:camEmp.id,startTime:'07:00',endTime:sh.ms,areaId:magAreas[0].id,hours:camH});
+        // deve lavorare almeno fino alle 11:00 (regola: chi entra alle 7 fa min 4h)
+        const camMinEnd=Math.max(t2m(sh.ms),t2m('11:00')); // almeno apertura o 11:00
+        const camEndM=camMinEnd;
+        const camH=shiftH('07:00',m2t(camEndM));
+        // Se l'orario del negozio va oltre le 11 in mattinata, il turno camion
+        // si estende fino all'apertura normale (già coperta dalla fase coverPeriod)
+        sch.days[dayKey].shifts.push({employeeId:camEmp.id,startTime:'07:00',endTime:m2t(camEndM),areaId:magAreas[0].id,hours:camH});
         worked[camEmp.id]=(worked[camEmp.id]||0)+camH;
       }
     }
 
-    // Calcola rawEndM per un candidato dato cursor e pEndM
+    // ore disponibili per un dipendente dato cursor
+    const empBudget=(emp,cursor)=>{
+      const base=empMaxH(emp)>0?empMaxH(emp)-(worked[emp.id]||0):9;
+      const ot=extraBudget[emp.id]||0;
+      return base+ot;
+    };
+
+    // calcola fine turno rispettando: ore rimaste, max consecutive, gap futuro, fine periodo
     const calcRawEnd=(emp,cursor,pEndM)=>{
-      const maxH=empMaxH(emp);
-      const remH=maxH>0?maxH-(worked[emp.id]||0):9;
-      const consec=consecHAt(emp.id,cursor);
+      const remH=empBudget(emp,cursor);
+      const consec=consecHAt(emp.id,cursor,dayKey);
       const maxConsecRem=Math.max(0,6-consec);
       const nextFut=sch.days[dayKey].shifts
         .filter(s=>s.employeeId===emp.id&&t2m(s.startTime)>cursor)
@@ -792,7 +990,8 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return Math.min(cursor+remH*60,cursor+maxConsecRem*60,futureCap,pEndM);
     };
 
-    // Area-first, cursor-based scheduling
+    // ── b) COPERTURA AREE (area-first, cursor-based) ──
+    // Prima non-magazzino (obbligatorie), poi magazzino (sacrificabile)
     const coverPeriod=(areaList,pStartT,pEndT)=>{
       const covered=new Set();
       const pEndM=t2m(pEndT);
@@ -816,12 +1015,10 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             cursor=covering.reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
             fullyCovered=false; break;
           }
-
           const concNow=sch.days[dayKey].shifts.filter(s=>
             t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           ).length;
           if(S.maxConcurrentTotal&&concNow>=S.maxConcurrentTotal){
-            // slot globale pieno: aspetta che si liberi uno slot invece di abbandonare l'area
             const nx=sch.days[dayKey].shifts
               .filter(s=>t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor)
               .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
@@ -830,41 +1027,40 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             cursor=nx;
             continue;
           }
-
           const cands=working.filter(emp=>{
             if(sch.days[dayKey].shifts.some(s=>
               s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
             ))return false;
-            if(consecHAt(emp.id,cursor)>4)return false;
-            const maxH=empMaxH(emp);
-            const remH=maxH>0?maxH-(worked[emp.id]||0):9;
-            return remH>0.24;
+            if(consecHAt(emp.id,cursor,dayKey)>4)return false;
+            return empBudget(emp,cursor)>0.24;
           }).sort((a,b)=>{
             const profA=(isProfArea&&a.isProfumeria)?10:0;
             const profB=(isProfArea&&b.isProfumeria)?10:0;
             if(profA!==profB)return profB-profA;
-            const remA=empMaxH(a)>0?empMaxH(a)-(worked[a.id]||0):9;
-            const remB=empMaxH(b)>0?empMaxH(b)-(worked[b.id]||0):9;
-            return remB-remA;
+            return empBudget(b,cursor)-empBudget(a,cursor);
           });
 
           if(!cands.length){fullyCovered=false;break;}
 
-          // Prova ogni candidato in ordine finché uno può coprire ≥15min
           let assigned=false;
           for(const emp of cands){
             const rawEndM=calcRawEnd(emp,cursor,pEndM);
-            if(rawEndM-cursor<15)continue; // bloccato da futureCap/consecutive → prova prossimo
+            if(rawEndM-cursor<15)continue;
             const sT=m2t(cursor),eT=m2t(rawEndM);
             const actualH=shiftH(sT,eT);
-            sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:area.id,hours:actualH});
+            // Determina se questo è straordinario
+            const baseRem=empMaxH(emp)>0?empMaxH(emp)-(worked[emp.id]||0):actualH;
+            const isOT=baseRem<=0&&(extraBudget[emp.id]||0)>0;
+            sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:area.id,hours:actualH,overtime:isOT||undefined});
             worked[emp.id]=(worked[emp.id]||0)+actualH;
+            if(isOT)overtimeH[emp.id]=(overtimeH[emp.id]||0)+actualH;
+            // scala budget extra se straordinario
+            if(isOT&&extraBudget[emp.id]){extraBudget[emp.id]=Math.max(0,extraBudget[emp.id]-actualH)}
             cursor=rawEndM;
             assigned=true;
             break;
           }
           if(!assigned){
-            // nessun candidato può lavorare ORA: avanza al prossimo rilascio di slot
             const nextRelease=sch.days[dayKey].shifts
               .filter(s=>t2m(s.endTime)>cursor&&t2m(s.endTime)<pEndM)
               .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
@@ -873,43 +1069,39 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             cursor=nextRelease;
           }
         }
-
         if(fullyCovered&&cursor>=pEndM)covered.add(area.id);
       });
       return covered;
     };
 
+    // Ordine copertura: non-mag prima (obbligo), mag dopo (sacrificabile)
     const orderedAreas=[...nonMagAreas,...magAreas];
     const mornCov=coverPeriod(orderedAreas,sh.ms,isSplit?sh.me:sh.ae);
     const aftnCov=isSplit?coverPeriod(orderedAreas,sh.as,sh.ae):new Set([...mornCov]);
 
-    // Riempimento ore contrattuali: dopo la copertura minima, usa le ore rimanenti di contratto
-    // di ogni dipendente assegnando turni aggiuntivi in qualsiasi area disponibile.
-    // Regola principale: ogni dipendente deve fare TUTTE le ore previste dal contratto ogni settimana.
+    // ── c) RIEMPIMENTO ORE CONTRATTUALI + STRAORDINARI ──
+    // Priorità 1 (regola nuova): prima riempi TUTTA la settimana assegnando ore a ogni giorno
+    // Questo fillHours completa il contratto di ogni dipendente nel giorno corrente
     const fillHours=(pStartT,pEndT)=>{
       const pStartM=t2m(pStartT),pEndM=t2m(pEndT);
-      // Ordina: più ore rimanenti prima (più urgente completare il contratto)
       const sortedW=[...working].sort((a,b)=>{
-        const rA=empMaxH(a)>0?empMaxH(a)-(worked[a.id]||0):0;
-        const rB=empMaxH(b)>0?empMaxH(b)-(worked[b.id]||0):0;
+        const rA=empBudget(a,pStartM);
+        const rB=empBudget(b,pStartM);
         return rB-rA;
       });
       sortedW.forEach(emp=>{
         const maxH=empMaxH(emp);
-        if(maxH<=0)return; // orario fisso senza limite ore → gestito altrove
+        if(maxH<=0)return;
         let cursor=pStartM;
         while(cursor<pEndM){
-          const remH=maxH-(worked[emp.id]||0);
-          if(remH<=0.24)break; // ore contratto completate
-          // già al lavoro in questo momento → salta alla fine del turno attivo
+          const totalBudget=empBudget(emp,cursor);
+          if(totalBudget<=0.24)break;
           const act=sch.days[dayKey].shifts.find(s=>
             s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           );
           if(act){cursor=t2m(act.endTime);continue;}
-          // regola pausa: >4h consecutive → salta 2h
-          const consec=consecHAt(emp.id,cursor);
+          const consec=consecHAt(emp.id,cursor,dayKey);
           if(consec>4){cursor=Math.min(cursor+120,pEndM);continue;}
-          // limite globale contemporanei → avanza a quando si libera uno slot
           const concNow=sch.days[dayKey].shifts.filter(s=>
             t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           ).length;
@@ -919,20 +1111,18 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
               .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
             cursor=nx;continue;
           }
-          // calcola fine turno rispettando: ore rimaste, max consecutive, gap futuro
           const maxCR=Math.max(0,6-consec);
           const nxFut=sch.days[dayKey].shifts
             .filter(s=>s.employeeId===emp.id&&t2m(s.startTime)>cursor)
             .sort((a,b)=>t2m(a.startTime)-t2m(b.startTime))[0];
           const fCap=nxFut?t2m(nxFut.startTime)-120:pEndM;
-          const rawE=Math.min(cursor+remH*60,cursor+maxCR*60,fCap,pEndM);
+          const rawE=Math.min(cursor+totalBudget*60,cursor+maxCR*60,fCap,pEndM);
           if(rawE-cursor<15){
-            // slot troppo corto: salta al prossimo turno futuro o esci
             if(nxFut&&t2m(nxFut.startTime)<pEndM){cursor=t2m(nxFut.startTime);}
             else break;
             continue;
           }
-          // migliore area: prima le aree con meno presenti (scoperte prioritarie), non-mag prima
+          // migliore area disponibile (non-mag prima)
           const bestA=orderedAreas
             .filter(a=>{
               const mc=a.maxConcurrent||999;
@@ -944,10 +1134,9 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             .sort((a,b)=>{
               const ccA=sch.days[dayKey].shifts.filter(s=>s.areaId===a.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor).length;
               const ccB=sch.days[dayKey].shifts.filter(s=>s.areaId===b.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor).length;
-              return ccA-ccB; // meno presenti prima (scoperte prioritarie)
+              return ccA-ccB;
             })[0];
           if(!bestA){
-            // tutte le aree al limite → avanza a quando si libera uno slot
             const nx2=sch.days[dayKey].shifts
               .filter(s=>t2m(s.endTime)>cursor&&t2m(s.endTime)<=pEndM)
               .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
@@ -955,53 +1144,61 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
           }
           const sT=m2t(cursor),eT=m2t(rawE);
           const actualH=shiftH(sT,eT);
-          sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:bestA.id,hours:actualH});
+          const baseRem=empMaxH(emp)>0?empMaxH(emp)-(worked[emp.id]||0):actualH;
+          const isOT=baseRem<=0;
+          sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:bestA.id,hours:actualH,overtime:isOT||undefined});
           worked[emp.id]=(worked[emp.id]||0)+actualH;
+          if(isOT){overtimeH[emp.id]=(overtimeH[emp.id]||0)+actualH;if(extraBudget[emp.id])extraBudget[emp.id]=Math.max(0,extraBudget[emp.id]-actualH)}
           cursor=rawE;
         }
       });
     };
-    // Più passaggi: ogni pass cattura slot liberati dal pass precedente
+
     for(let _p=0;_p<4;_p++){
       fillHours(sh.ms,isSplit?sh.me:sh.ae);
       if(isSplit)fillHours(sh.as,sh.ae);
     }
 
-    // Avvisi copertura — segnala TUTTE le aree scoperte (magazzino incluso, è eccezione solo in carenza)
+    // ── Avvisi copertura ──
+    // Non-mag sempre segnalate; mag segnalata solo se NESSUNA area è coperta
     S.areas.forEach(a=>{
+      const isMag=isMagArea(a);
       const covMorn=mornCov.has(a.id);
       const covAftn=isSplit?aftnCov.has(a.id):covMorn;
-      if(!covMorn&&!covAftn){
-        warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): area "${a.name}" non coperta (carenza personale)`);
-      } else if(isSplit&&(!covMorn||!covAftn)){
-        warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): "${a.name}" scoperta nel ${!covMorn?'mattino':'pomeriggio'}`);
+      if(isMag){
+        // sacrificabile: segnala solo se anche le altre aree hanno problemi
+        if(!covMorn&&!covAftn){
+          warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): "${a.name}" non coperta (accettabile per carenza personale)`);
+        }
+      } else {
+        if(!covMorn&&!covAftn){
+          warnings.push(`⚠️ ${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): area "${a.name}" NON coperta — verificare disponibilità personale`);
+        } else if(isSplit&&(!covMorn||!covAftn)){
+          warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): "${a.name}" scoperta nel ${!covMorn?'mattino':'pomeriggio'}`);
+        }
       }
     });
   });
 
-  // Avviso capacità strutturale: ore contratto vs slot disponibili
-  if(S.maxConcurrentTotal){
-    const totalContracted=flexEmps.reduce((s,e)=>s+(empMaxH(e)||0),0);
-    const totalOpenH=openDays.reduce((s,dk)=>{
-      const sh=S.storeHours[dk];if(!sh)return s;
-      const mH=(t2m(sh.type==='split'?sh.me:sh.ae)-t2m(sh.ms))/60;
-      const aH=sh.type==='split'?(t2m(sh.ae)-t2m(sh.as))/60:0;
-      return s+mH+aH;
-    },0);
-    const weekCap=S.maxConcurrentTotal*totalOpenH;
-    if(totalContracted>weekCap+0.5){
-      warnings.push(`⚠️ Capacità insufficiente: ${totalContracted}h contrattuali vs ${Math.round(weekCap*10)/10}h disponibili (${S.maxConcurrentTotal} presenze × ${Math.round(totalOpenH*10)/10}h/sett). Impossibile coprire tutte le ore — aumenta il limite presenze contemporanee.`);
-    }
-  }
-
-  // Avviso ore mancanti per dipendente
+  // ── Avvisi straordinari ──
   flexEmps.forEach(e=>{
-    const maxH=empMaxH(e); if(!maxH)return;
-    const missing=Math.round((maxH-(worked[e.id]||0))*10)/10;
-    if(missing>0.5) warnings.push(`${weekRange(weekStartISO)}: ${e.name} — ${missing}h mancanti (${Math.round((worked[e.id]||0)*10)/10}h su ${maxH}h contratto)`);
+    const ot=Math.round((overtimeH[e.id]||0)*10)/10;
+    if(ot>0){
+      warnings.push(`📌 STRAORDINARI — ${e.name}: +${ot}h questa settimana (ore extra per copertura negozio)`);
+    }
   });
 
-  return {weekStart:weekStartISO,days:sch.days,worked};
+  // ── Avviso ore mancanti ──
+  flexEmps.forEach(e=>{
+    const maxH=empMaxH(e); if(!maxH)return;
+    const workedWithOt=(worked[e.id]||0);
+    const contractual=Math.min(workedWithOt,maxH);
+    const missing=Math.round((maxH-contractual)*10)/10;
+    if(missing>0.5) warnings.push(`${weekRange(weekStartISO)}: ${e.name} — ${missing}h mancanti (${Math.round(contractual*10)/10}h su ${maxH}h contratto)`);
+  });
+
+  // Allega dati straordinari al risultato per visualizzazione
+  return {weekStart:weekStartISO,days:sch.days,worked,overtimeH};
 }
 
 /* ═══════════════ MULTI-WEEK GENERATION ═══════════════ */
@@ -1087,12 +1284,16 @@ function showGenPreview(weekIdx){
   // Rebuild nav buttons
   navEl.innerHTML=S.weekSchedules.map((_,i)=>`<button class="btn ${i===weekIdx?'btn-primary':'btn-secondary'} btn-sm" onclick="showGenPreview(${i})">${i+1}</button>`).join('');
 
-  // Recalculate worked hours from schedule
+  // Recalculate worked hours and overtime from schedule
   const worked={};
-  S.employees.forEach(e=>{worked[e.id]=0});
+  const overtimeH={};
+  S.employees.forEach(e=>{worked[e.id]=0;overtimeH[e.id]=0});
   DAYS_KEY.forEach(k=>{
     if(sch.days[k]){
-      sch.days[k].shifts.forEach(s=>{worked[s.employeeId]=(worked[s.employeeId]||0)+s.hours});
+      sch.days[k].shifts.forEach(s=>{
+        worked[s.employeeId]=(worked[s.employeeId]||0)+s.hours;
+        if(s.overtime)overtimeH[s.employeeId]=(overtimeH[s.employeeId]||0)+s.hours;
+      });
     }
   });
 
@@ -1103,14 +1304,16 @@ function showGenPreview(weekIdx){
     const w=Math.round((worked[emp.id]||0)*10)/10;
     const pct=max>0?Math.min((w/max)*100,100):0;
     const over=max>0&&w>max;
-    const full=!over&&max>0&&pct>=99.5; // ≥99.5% = pieno (gestisce arrotondamenti)
+    const full=!over&&max>0&&pct>=99.5;
     const near=!over&&!full&&pct>85;
+    const ot=Math.round((overtimeH[emp.id]||0)*10)/10;
     let restDay='—';
     DAYS_KEY.forEach((k,i)=>{if(sch.days[k]&&sch.days[k].dayOff.includes(emp.id)){restDay=DAYS_FULL[i]+((!S.storeHours[k]||!S.storeHours[k].open)?' (chiusura)':'');}});
     return `<tr>
       <td><strong>${esc(emp.name)}</strong></td>
       <td>${max>0?max+'h':'Fisso'}</td>
-      <td>${w}h<div class="hrs-bar"><div class="hrs-fill ${over?'over':near?'near':''}" style="width:${pct}%"></div></div></td>
+      <td>${Math.min(w,max>0?max:w).toFixed(1)}h<div class="hrs-bar"><div class="hrs-fill ${over?'over':near?'near':''}" style="width:${pct}%"></div></div></td>
+      <td>${ot>0?`<span class="badge b-orange">+${ot}h straord.</span>`:'<span class="text-muted text-xs">—</span>'}</td>
       <td>${over?'<span class="badge b-red">Ore eccedute</span>':full?'<span class="badge b-green">✓ Pieno</span>':near?'<span class="badge b-yellow">Quasi pieno</span>':'<span class="badge b-green">✓ OK</span>'}</td>
       <td>${restDay}</td>
     </tr>`;
@@ -1233,7 +1436,8 @@ function renderSchedule(){
 
       const shiftsHtml=shifts.map(s=>{
         const area=getArea(s.areaId);const color=area?area.color:'#3498DB';
-        return `<div class="shift-chip" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div></div>`;
+        const otBadge=s.overtime?'<div class="badge-ot">📌 STRAORDINARIO</div>':'';
+        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}</div>`;
       }).join('');
 
       html+=`<td><div class="day-cell" ${clickFn} style="${cursor}" ${!isReadOnly?'title="Clicca per modificare"':''}>${shiftsHtml}</div></td>`;
@@ -1914,6 +2118,8 @@ function renderAll(){renderEmployees();renderAreas();document.getElementById('st
 /* ═══════════════ INIT ═══════════════ */
 (async()=>{
   const overlay=document.getElementById('loadingOverlay');
+  // Auth check first — blocks UI until password verified
+  await authInit();
   // Try Supabase first; fall back to localStorage if offline/empty
   const fromCloud=await loadFromSupabase();
   if(!fromCloud)load();
