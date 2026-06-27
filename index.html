@@ -959,15 +959,8 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
   };
 
   // ── PASSO 1: calcola deficit orario totale della settimana ──
-  // Confronta ore contrattuali totali flex vs slot-ora disponibili totali
   const totalContractH=flexEmps.reduce((s,e)=>s+(empMaxH(e)||0),0);
-  const totalSlotH=openDays.reduce((s,dk)=>{
-    const sh=S.storeHours[dk];if(!sh)return s;
-    const mH=(t2m(sh.type==='split'?sh.me:sh.ae)-t2m(sh.ms))/60;
-    const aH=sh.type==='split'?(t2m(sh.ae)-t2m(sh.as))/60:0;
-    return s+(mH+aH)*Math.min(flexEmps.length,S.maxConcurrentTotal||flexEmps.length);
-  },0);
-  // stima ore necessarie a coprire minimo 1 persona per area per giorno aperto
+  // stima ore necessarie a coprire minimo 1 persona per area non-magazzino per giorno aperto
   const totalAreaCovH=openDays.reduce((s,dk)=>{
     const sh=S.storeHours[dk];if(!sh)return s;
     const dayH_val=sh.type==='split'?(t2m(sh.me)-t2m(sh.ms))/60+(t2m(sh.ae)-t2m(sh.as))/60:(t2m(sh.ae)-t2m(sh.ms))/60;
@@ -990,6 +983,10 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
   const isMagArea=a=>a.name.toLowerCase().includes('magazzino');
   const nonMagAreas=S.areas.filter(a=>!isMagArea(a));
   const magAreas   =S.areas.filter(a=>isMagArea(a));
+
+  if(!S.areas.length){
+    warnings.push(`⚠️ Nessuna area configurata — i turni vengono assegnati senza area. Configura le aree prima di generare.`);
+  }
 
   openDays.forEach(dayKey=>{
     const dayIdx=DAYS_KEY.indexOf(dayKey);
@@ -1025,15 +1022,23 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       working.filter(emp=>sunWorkerIds.has(emp.id)).forEach(emp=>{
         const area=sunAreas[areaIdx%sunAreas.length]||sunAreas[0];
         areaIdx++;
+        const base=empMaxH(emp);
+        const alreadyWorked=worked[emp.id]||0;
+        const isOT=base>0&&(alreadyWorked+sunH)>base;
         sch.days['sun'].shifts.push({
           employeeId:emp.id,
           startTime:sunStart,
           endTime:sunEnd,
           areaId:area?area.id:'',
           hours:sunH,
-          sundayFull:true
+          sundayFull:true,
+          overtime:isOT||undefined
         });
         worked[emp.id]=(worked[emp.id]||0)+sunH;
+        if(isOT){
+          const otH=Math.min(sunH,(alreadyWorked+sunH)-base);
+          overtimeH[emp.id]=(overtimeH[emp.id]||0)+otH;
+        }
       });
       // Segna domenica come lavorata per rotazione futura
       sunWorkerIds.forEach(id=>{restHistory['sun_'+id]=weekIndex});
@@ -1090,11 +1095,16 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       if(!empShifts.length)return;
       const last=empShifts[0];
       // Mai superare la chiusura del negozio né le 23:59
-      const dayCloseM=t2m(sh.ae); // orario chiusura negozio quel giorno
+      const dayCloseM=t2m(sh.ae);
       const hardCap=Math.min(dayCloseM,23*60+59);
       const currentEndM=t2m(last.endTime);
-      if(currentEndM>=hardCap)return; // già alla chiusura, niente da estendere
-      const allowedExtra=Math.min(extraMinutes,hardCap-currentEndM);
+      if(currentEndM>=hardCap)return;
+      // Rispetta il limite di 6h consecutive: calcola quanto dura già il turno
+      const shiftDurM=t2m(last.endTime)-t2m(last.startTime);
+      const maxExtM=Math.max(0,(6*60)-shiftDurM); // minuti aggiuntivi consentiti prima del cap 6h
+      const allowedExtra=Math.min(extraMinutes,hardCap-currentEndM,maxExtM>0?maxExtM:extraMinutes);
+      // Se il turno è già a 6h, non estendere (forza pausa)
+      if(shiftDurM>=6*60)return;
       if(allowedExtra<=0)return;
       const newEndM=currentEndM+allowedExtra;
       const newEnd=m2t(newEndM);
@@ -1102,7 +1112,6 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       last.endTime=newEnd;
       last.hours=(last.hours||0)+addedH;
       worked[emp.id]=(worked[emp.id]||0)+addedH;
-      // segna come straordinario se supera contratto
       const base=empMaxH(emp);
       if(base>0&&worked[emp.id]>base){
         last.overtime=true;
@@ -1361,8 +1370,11 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
 /* ═══════════════ MULTI-WEEK GENERATION ═══════════════ */
 function generateSchedule(){
   if(!S.currentWeekStart){toast('Seleziona prima una settimana');return}
+  if(!S.employees.length){toast('Nessun dipendente configurato — aggiungine almeno uno');return}
+  if(!S.areas.length){toast('Nessuna area configurata — aggiungine almeno una');return}
+  const openDaysCheck=DAYS_KEY.filter(k=>S.storeHours[k]&&S.storeHours[k].open);
+  if(!openDaysCheck.length){toast('Nessun giorno di apertura configurato — vai in "Orari Negozio"');return}
   S.genWeekCount=parseInt(document.getElementById('numWeeks').value)||1;
-  // If there are already current schedules, ask about archiving first
   if(S.weekSchedules&&S.weekSchedules.length>0){
     openArchiveModal();
   } else {
