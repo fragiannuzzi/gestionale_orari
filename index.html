@@ -332,6 +332,7 @@ textarea.form-control{resize:vertical;min-height:64px}
           <li><strong>Priorità 2 — Contemporaneità per area</strong>: Magazzino-Vendita è sacrificabile in caso di carenza personale</li>
           <li><strong>Domenica: esattamente 3 persone</strong>, turno completo (apertura→chiusura), a rotazione settimanale — non sempre le stesse 3</li>
           <li>Chi inizia alle 07:00 (camion) deve fare <strong>almeno fino alle 11:00</strong> (min. 4h)</li>
+          <li>Turno minimo: <strong>2 ore</strong> — nessun turno inferiore viene assegnato</li>
           <li>Turno spezzato: max 6h consecutive, poi pausa obbligatoria ≥ 2h</li>
           <li>1 giorno di riposo settimanale per dipendente, a rotazione</li>
           <li>Rispetto ore contrattuali settimanali</li>
@@ -433,6 +434,7 @@ const DAYS_KEY  = ['mon','tue','wed','thu','fri','sat','sun'];
 const DAYS_FULL = ['Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato','Domenica'];
 const DAYS_SHORT= ['Lun','Mar','Mer','Gio','Ven','Sab','Dom'];
 const PALETTE   = ['#E74C3C','#E67E22','#F39C12','#2ECC71','#1ABC9C','#3498DB','#9B59B6','#E91E63','#FF5722','#607D8B','#27AE60','#2980B9','#8E44AD','#D35400'];
+const MIN_SHIFT_M = 120; // durata minima turno: 2 ore (in minuti)
 
 /* ═══════════════ DEFAULT STATE ═══════════════ */
 function defaultState(){
@@ -1076,6 +1078,39 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return Math.min(cursor+remH*60,cursor+maxConsecRem*60,futureCap,pEndM);
     };
 
+    // ── HELPER: estendi l'ultimo turno di empId di questo giorno ──
+    // Usato quando il frammento disponibile è < MIN_SHIFT_M ma il dipendente
+    // ha già un turno: aggiungiamo le ore residue all'ultimo turno esistente
+    // anche se va in straordinario.
+    const extendLastShift=(emp,extraMinutes)=>{
+      if(extraMinutes<=0)return;
+      const empShifts=sch.days[dayKey].shifts
+        .filter(s=>s.employeeId===emp.id)
+        .sort((a,b)=>t2m(b.endTime)-t2m(a.endTime));
+      if(!empShifts.length)return;
+      const last=empShifts[0];
+      // Mai superare la chiusura del negozio né le 23:59
+      const dayCloseM=t2m(sh.ae); // orario chiusura negozio quel giorno
+      const hardCap=Math.min(dayCloseM,23*60+59);
+      const currentEndM=t2m(last.endTime);
+      if(currentEndM>=hardCap)return; // già alla chiusura, niente da estendere
+      const allowedExtra=Math.min(extraMinutes,hardCap-currentEndM);
+      if(allowedExtra<=0)return;
+      const newEndM=currentEndM+allowedExtra;
+      const newEnd=m2t(newEndM);
+      const addedH=allowedExtra/60;
+      last.endTime=newEnd;
+      last.hours=(last.hours||0)+addedH;
+      worked[emp.id]=(worked[emp.id]||0)+addedH;
+      // segna come straordinario se supera contratto
+      const base=empMaxH(emp);
+      if(base>0&&worked[emp.id]>base){
+        last.overtime=true;
+        const otAdded=Math.min(addedH,worked[emp.id]-base);
+        overtimeH[emp.id]=(overtimeH[emp.id]||0)+otAdded;
+      }
+    };
+
     // ── b) COPERTURA AREE (area-first, cursor-based) ──
     // Prima non-magazzino (obbligatorie), poi magazzino (sacrificabile)
     const coverPeriod=(areaList,pStartT,pEndT)=>{
@@ -1090,6 +1125,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
         let fullyCovered=true;
 
         while(cursor<pEndM){
+          const _cursorSnapshot=cursor; // safety: se il cursor non avanza → break
           const covering=sch.days[dayKey].shifts.filter(s=>
             s.areaId===area.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           );
@@ -1118,7 +1154,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
               s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
             ))return false;
             if(consecHAt(emp.id,cursor,dayKey)>4)return false;
-            return empBudget(emp,cursor)>0.24;
+            return empBudget(emp,cursor)>MIN_SHIFT_M/60;
           }).sort((a,b)=>{
             const profA=(isProfArea&&a.isProfumeria)?10:0;
             const profB=(isProfArea&&b.isProfumeria)?10:0;
@@ -1126,34 +1162,57 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             return empBudget(b,cursor)-empBudget(a,cursor);
           });
 
-          if(!cands.length){fullyCovered=false;break;}
+          if(!cands.length){
+            // Nessun candidato con ≥2h disponibili.
+            // Prova a estendere chi ha già un turno oggi che finisce al cursor
+            const extCands=working.filter(emp=>
+              sch.days[dayKey].shifts.some(s=>s.employeeId===emp.id&&t2m(s.endTime)===cursor)
+            );
+            if(extCands.length>0){
+              const emp=extCands[0];
+              const extMin=pEndM-cursor; // estendi fino alla fine del periodo
+              if(extMin>0){extendLastShift(emp,extMin);cursor=pEndM;}
+            }
+            fullyCovered=false;break; // in ogni caso esci dal while
+          }
 
           let assigned=false;
+          const prevCursor=cursor; // salva per rilevare cursor fermo
           for(const emp of cands){
             const rawEndM=calcRawEnd(emp,cursor,pEndM);
-            if(rawEndM-cursor<15)continue;
+            if(rawEndM<=cursor)continue; // calcRawEnd non avanza → salta
+            if(rawEndM-cursor<MIN_SHIFT_M){
+              // frammento troppo corto: estendi l'ultimo turno esistente
+              const hasShiftToday=sch.days[dayKey].shifts.some(s=>s.employeeId===emp.id);
+              if(hasShiftToday&&rawEndM>cursor){
+                extendLastShift(emp,rawEndM-cursor);
+                cursor=rawEndM;
+                assigned=true;
+              }
+              continue;
+            }
             const sT=m2t(cursor),eT=m2t(rawEndM);
             const actualH=shiftH(sT,eT);
-            // Determina se questo è straordinario
             const baseRem=empMaxH(emp)>0?empMaxH(emp)-(worked[emp.id]||0):actualH;
             const isOT=baseRem<=0&&(extraBudget[emp.id]||0)>0;
             sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:sT,endTime:eT,areaId:area.id,hours:actualH,overtime:isOT||undefined});
             worked[emp.id]=(worked[emp.id]||0)+actualH;
             if(isOT)overtimeH[emp.id]=(overtimeH[emp.id]||0)+actualH;
-            // scala budget extra se straordinario
             if(isOT&&extraBudget[emp.id]){extraBudget[emp.id]=Math.max(0,extraBudget[emp.id]-actualH)}
             cursor=rawEndM;
             assigned=true;
             break;
           }
-          if(!assigned){
+          if(!assigned||cursor<=prevCursor){
+            // cursor non è avanzato: esci per evitare loop infinito
             const nextRelease=sch.days[dayKey].shifts
               .filter(s=>t2m(s.endTime)>cursor&&t2m(s.endTime)<pEndM)
               .reduce((mn,s)=>Math.min(mn,t2m(s.endTime)),pEndM);
             fullyCovered=false;
-            if(nextRelease>=pEndM)break;
+            if(nextRelease>=pEndM||nextRelease<=cursor)break;
             cursor=nextRelease;
           }
+          if(cursor===_cursorSnapshot){fullyCovered=false;break;} // safety net
         }
         if(fullyCovered&&cursor>=pEndM)covered.add(area.id);
       });
@@ -1179,9 +1238,11 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
         const maxH=empMaxH(emp);
         if(maxH<=0)return;
         let cursor=pStartM;
+        let _fillSafe=0; // safety counter anti-loop
         while(cursor<pEndM){
+          if(++_fillSafe>2000)break; // max 2000 iterazioni per dipendente per periodo
           const totalBudget=empBudget(emp,cursor);
-          if(totalBudget<=0.24)break;
+          if(totalBudget<=MIN_SHIFT_M/60)break;
           const act=sch.days[dayKey].shifts.find(s=>
             s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           );
@@ -1203,9 +1264,19 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             .sort((a,b)=>t2m(a.startTime)-t2m(b.startTime))[0];
           const fCap=nxFut?t2m(nxFut.startTime)-120:pEndM;
           const rawE=Math.min(cursor+totalBudget*60,cursor+maxCR*60,fCap,pEndM);
-          if(rawE-cursor<15){
-            if(nxFut&&t2m(nxFut.startTime)<pEndM){cursor=t2m(nxFut.startTime);}
-            else break;
+          if(rawE<=cursor){break;} // budget o consec azzerati: esci
+          if(rawE-cursor<MIN_SHIFT_M){
+            // frammento troppo corto per un nuovo turno
+            const hasShiftToday=sch.days[dayKey].shifts.some(s=>s.employeeId===emp.id);
+            if(hasShiftToday){
+              extendLastShift(emp,rawE-cursor);
+              cursor=rawE; // cursor avanza sempre
+              continue;
+            }
+            // nessun turno da estendere: salta al prossimo turno futuro o esci
+            if(nxFut&&t2m(nxFut.startTime)>cursor&&t2m(nxFut.startTime)<pEndM){
+              cursor=t2m(nxFut.startTime);
+            } else {break;}
             continue;
           }
           // migliore area disponibile (non-mag prima)
@@ -2108,7 +2179,7 @@ function refreshEmpSchedule(empId){
         const startTime=emp.takesMorningDelivery?'07:00':sh.ms;
         const endTime=m2t(Math.min(t2m(startTime)+availH*60,t2m(sh.ae)));
         const actualH=shiftH(startTime,endTime);
-        if(actualH<0.25)return;
+        if(actualH<MIN_SHIFT_M/60)return;
         // Global max concurrent check
         if(S.maxConcurrentTotal&&sch.days[dayKey].shifts.length>=S.maxConcurrentTotal)return;
         // Find uncovered area respecting per-area maxConcurrent
