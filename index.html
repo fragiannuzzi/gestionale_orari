@@ -862,41 +862,55 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     if(restDay&&!sch.days[restDay].dayOff.includes(emp.id))sch.days[restDay].dayOff.push(emp.id);
   });
 
-  // ── DOMENICA: max 3 persone, turno completo, rotazione settimanale ──
-  // Logica:
-  //  1. Se domenica è aperta, seleziona esattamente 3 flex emp a rotazione
-  //     (usando weekIndex come seed di rotazione, penalizzando chi ha già lavorato domenica di recente)
-  //  2. Chi NON è tra i 3 va in dayOff domenica
-  //  3. I 3 selezionati faranno turno COMPLETO (apertura→chiusura) gestito in openDays.forEach
-  const SUN_WORKERS=3; // numero fisso domenica
-  const sunWorkerIds=new Set(); // empId dei 3 che lavorano domenica
+  // ── DOMENICA: sempre 3 persone totali ──
+  // Regola:
+  //  - Se ci sono dipendenti fissi con turno domenica → flex aggiuntivi = 3 - fissi
+  //    (il fisso copre il suo orario parziale; i flex coprono tutta la giornata)
+  //  - Se nessun fisso domenica → 3 flex con turno completo
+  //  - Mai meno di 3 persone domenica (salvo carenza reale di personale)
+  //  - I flex domenica fanno sempre turno completo apertura→chiusura
+  //  - Rotazione settimanale tra i flex
+  const SUN_WORKERS_TOTAL=3;
+  const sunWorkerIds=new Set();
   const sundayOpen=openDays.includes('sun')&&S.storeHours['sun']&&S.storeHours['sun'].open;
+  let fixedSunCount=0; // dichiarata qui per essere accessibile nel loop openDays
 
   if(sundayOpen){
-    // Candidati domenica: flex emp non in ferie, non con dayOff fisso domenica
-    const sunDate=isoDate(addDays(weekStart,6)); // domenica è index 6
+    const sunDate=isoDate(addDays(weekStart,6));
+
+    const fixedSunWorkers=fixedEmps.filter(emp=>{
+      if(isOnVacation(emp,weekStartISO))return false;
+      if((emp.daysOff||[]).includes(sunDate))return false;
+      if((emp.permissionDays||[]).includes(sunDate))return false;
+      const hasBiweekly=emp.fixedScheduleB&&emp.fixedScheduleB.length>0;
+      let activeSch=emp.fixedSchedule||[];
+      if(hasBiweekly){
+        const startOffset=emp.biweeklyFirstWeek==='B'?1:0;
+        if((weekIndex+startOffset)%2===1)activeSch=emp.fixedScheduleB;
+      }
+      return activeSch.some(fs=>fs.day==='sun');
+    });
+    fixedSunCount=fixedSunWorkers.length;
+    const flexNeeded=Math.max(0,SUN_WORKERS_TOTAL-fixedSunCount);
+
+    // Candidati flex domenica
     const sunCandidates=flexEmps.filter(emp=>{
-      if(emp.isDirectore)return false; // direttore sempre libero domenica
+      if(emp.isDirectore)return false;
       if((emp.daysOff||[]).includes(sunDate))return false;
       if((emp.permissionDays||[]).includes(sunDate))return false;
       return true;
     });
 
-    // Rotazione: ordina i candidati per "chi ha riposato domenica più di recente"
-    // Usiamo sunRestHistory passato come parametro (vedi doGenerate)
-    // In assenza, usiamo weekIndex per ruotare ciclicamente
+    // Rotazione: penalizza chi ha lavorato domenica più di recente
     const sorted=[...sunCandidates].sort((a,b)=>{
-      // Penalizza chi ha lavorato domenica la settimana scorsa (sunLastWorked)
       const lastA=restHistory['sun_'+a.id]||(-1);
       const lastB=restHistory['sun_'+b.id]||(-1);
-      // Chi ha lavorato domenica più di recente va in fondo
       if(lastA!==lastB)return lastA-lastB;
-      // Parità: ruota per weekIndex usando posizione nell'array
       return sunCandidates.indexOf(a)-sunCandidates.indexOf(b);
     });
 
-    // Prendi i primi SUN_WORKERS
-    const chosen=sorted.slice(0,Math.min(SUN_WORKERS,sorted.length));
+    // Prendi i primi flexNeeded
+    const chosen=sorted.slice(0,Math.min(flexNeeded,sorted.length));
     chosen.forEach(e=>sunWorkerIds.add(e.id));
 
     // Tutti i flex non scelti → dayOff domenica
@@ -1043,9 +1057,13 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       // Segna domenica come lavorata per rotazione futura
       sunWorkerIds.forEach(id=>{restHistory['sun_'+id]=weekIndex});
       // Avviso se meno di 3 disponibili
-      const actualSun=working.filter(emp=>sunWorkerIds.has(emp.id)).length;
-      if(actualSun<SUN_WORKERS){
-        warnings.push(`Domenica (${weekRange(weekStartISO)}): solo ${actualSun} su ${SUN_WORKERS} lavoratori disponibili`);
+      const actualFlex=working.filter(emp=>sunWorkerIds.has(emp.id)).length;
+      const totalSun=actualFlex+fixedSunCount;
+      if(totalSun<SUN_WORKERS_TOTAL){
+        const msg=fixedSunCount>0
+          ? `Domenica (${weekRange(weekStartISO)}): presenti ${totalSun} su ${SUN_WORKERS_TOTAL} (${fixedSunCount} fisso + ${actualFlex} flex su ${Math.max(0,SUN_WORKERS_TOTAL-fixedSunCount)} richiesti) — carenza personale`
+          : `Domenica (${weekRange(weekStartISO)}): solo ${actualFlex} su ${SUN_WORKERS_TOTAL} lavoratori disponibili — carenza personale`;
+        warnings.push(msg);
       }
       return; // domenica gestita — salta coverPeriod e fillHours normali
     }
