@@ -439,7 +439,7 @@ const DAYS_KEY  = ['mon','tue','wed','thu','fri','sat','sun'];
 const DAYS_FULL = ['Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato','Domenica'];
 const DAYS_SHORT= ['Lun','Mar','Mer','Gio','Ven','Sab','Dom'];
 const PALETTE   = ['#E74C3C','#E67E22','#F39C12','#2ECC71','#1ABC9C','#3498DB','#9B59B6','#E91E63','#FF5722','#607D8B','#27AE60','#2980B9','#8E44AD','#D35400'];
-const MIN_SHIFT_M = 120; // durata minima turno: 2 ore (in minuti)
+const MIN_SHIFT_M = 240; // durata minima turno: 4 ore (in minuti)
 
 /* ═══════════════ DEFAULT STATE ═══════════════ */
 function defaultState(){
@@ -1024,7 +1024,12 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     } else {
       // Lavoratori domenica o giorni normali: assegna riposo rotante lun-sab
       const weekdaysOnly=openDays.filter(d=>d!=='sun');
-      const pool=weekdaysOnly.length>0?weekdaysOnly:openDays;
+      let pool=weekdaysOnly.length>0?weekdaysOnly:openDays;
+      // Il dipendente camion NON può riposare nei giorni camion: escludili dal pool
+      if(emp.takesMorningDelivery){
+        const noCamion=pool.filter(d=>!(S.camionDays&&S.camionDays[d]));
+        if(noCamion.length>0)pool=noCamion; // usa solo giorni non-camion; se vuoto lascia il pool intero
+      }
       const sorted2=[...pool].sort((a,b)=>{
         const penA=(a===lastRest?100:0)+(restCount[a]||0);
         const penB=(b===lastRest?100:0)+(restCount[b]||0);
@@ -1569,8 +1574,11 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       // non iniziare un turno prima dell'apertura
       if(stM<t2m(sh2.ms))continue;
       const periodEnd=(sh2.type==='split'&&stM<t2m(sh2.me))?t2m(sh2.me):dayClose;
-      const maxLen=Math.min(periodEnd-stM,6*60,need);
-      if(maxLen<MIN_SHIFT_M)continue;
+      // Se il residuo è < MIN_SHIFT_M, usa il periodo intero (preferibile a lasciare carenza).
+      // Questo può generare al massimo un piccolo straordinario (< MIN_SHIFT_M).
+      const effectiveNeed=need<MIN_SHIFT_M?(periodEnd-stM):need;
+      const maxLen=Math.min(periodEnd-stM,6*60,effectiveNeed);
+      if(maxLen<MIN_SHIFT_M)continue; // rispetta sempre il turno minimo di 4h
       if(S.maxConcurrentTotal){
         const conc=dd.shifts.filter(s=>t2m(s.startTime)<=stM&&t2m(s.endTime)>stM).length;
         if(conc>=S.maxConcurrentTotal)continue;
@@ -2851,7 +2859,14 @@ function refreshEmpSchedule(empId){
       if(emp.isDirectore&&openDays.includes('sun')){
         restDay='sun';
       } else {
-        const sortedForRest=[...openDays].sort((a,b)=>{
+        let restPool=[...openDays].filter(d=>d!=='sun');
+        if(restPool.length===0)restPool=[...openDays];
+        // Il dipendente camion non può riposare nei giorni camion
+        if(emp.takesMorningDelivery){
+          const noCam=restPool.filter(d=>!(S.camionDays&&S.camionDays[d]));
+          if(noCam.length>0)restPool=noCam;
+        }
+        const sortedForRest=[...restPool].sort((a,b)=>{
           const penA=(a===lastRest?100:0)+(restCount[a]||0);
           const penB=(b===lastRest?100:0)+(restCount[b]||0);
           if(penA!==penB)return penA-penB;
