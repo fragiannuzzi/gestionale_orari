@@ -312,7 +312,7 @@ textarea.form-control{resize:vertical;min-height:64px}
         </div>
         <div>
           <div class="form-label" style="margin-bottom:6px">Oppure scegli data</div>
-          <input type="date" class="form-control" id="weekPicker" onchange="setWeekFromDate(this.value)" style="width:180px">
+          <input type="week" class="form-control" id="weekPicker" onchange="setWeekFromPicker(this.value)" style="width:180px">
         </div>
         <div>
           <div class="form-label" style="margin-bottom:6px">Numero settimane</div>
@@ -376,6 +376,7 @@ textarea.form-control{resize:vertical;min-height:64px}
     <div class="card-header">
       <div class="card-title" id="schTitle">Orario Settimanale</div>
       <div class="btn-group">
+        <button class="btn btn-secondary btn-sm" onclick="openCheckOrari()" id="checkOrariBtn" style="display:none">📊 Check Orari</button>
         <button class="btn btn-warning btn-sm" onclick="openEmergencyModal()" id="emergencyBtn" style="display:none">🚨 Assenza Urgente</button>
         <button class="btn btn-secondary btn-sm" onclick="window.print()">🖨 Stampa</button>
         <button class="btn btn-primary btn-sm" onclick="switchTab('generate')">⚙️ Genera</button>
@@ -643,7 +644,16 @@ function applyParsedState(p){
   if(!S.weekSchedules)S.weekSchedules=[];
   if(!S.archivedSchedules)S.archivedSchedules=[];
   if(!S.currentViewSource)S.currentViewSource='current';
-  (S.employees||[]).forEach(e=>{if(!e.vacations)e.vacations=[]});
+  (S.employees||[]).forEach(e=>{if(!e.vacations)e.vacations=[];if(!e.vacationOverrides)e.vacationOverrides=[]});
+  // Normalizza currentWeekStart al lunedì (settimana standard lun→dom)
+  if(S.currentWeekStart){
+    const norm=isoDate(getMonday(new Date(S.currentWeekStart+'T00:00:00')));
+    if(norm!==S.currentWeekStart)S.currentWeekStart=norm;
+  }
+  // Normalizza anche le settimane già generate
+  (S.weekSchedules||[]).forEach(sc=>{
+    if(sc.weekStart){const nm=isoDate(getMonday(new Date(sc.weekStart+'T00:00:00')));if(nm!==sc.weekStart)sc.weekStart=nm;}
+  });
 }
 function load(){
   try{const r=localStorage.getItem('gest_orari_v4');if(r)applyParsedState(JSON.parse(r))}catch(e){}
@@ -668,23 +678,42 @@ function shiftH(s,e){return Math.max(0,(t2m(e)-t2m(s))/60)}
 function dayH(sh){if(!sh||!sh.open)return 0;if(sh.type==='continuous')return(t2m(sh.ae)-t2m(sh.ms))/60;return(t2m(sh.me)-t2m(sh.ms))/60+(t2m(sh.ae)-t2m(sh.as))/60}
 function getMonday(d){const dt=new Date(d);const day=dt.getDay();const diff=day===0?-6:1-day;dt.setDate(dt.getDate()+diff);dt.setHours(0,0,0,0);return dt}
 function addDays(d,n){const dt=new Date(d);dt.setDate(dt.getDate()+n);return dt}
-function isoDate(d){return d.toISOString().slice(0,10)}
+function isoDate(d){
+  // Usa componenti locali, non toISOString (che converte in UTC e può shiftare il giorno)
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 function fmtShort(d){return d.toLocaleDateString('it-IT',{day:'2-digit',month:'2-digit'})}
 function weekRange(wsISO){const ws=new Date(wsISO+'T00:00:00');const we=addDays(ws,6);return fmtShort(ws)+' – '+fmtShort(we)+' '+we.getFullYear()}
-function empMaxH(e){if(e.hoursType==='38')return 38;if(e.hoursType==='40')return 40;if(e.hoursType==='custom')return parseFloat(e.customHours)||38;return 0}
+function empMaxH(e){if(e.isDirectore)return 0;if(e.hoursType==='38')return 38;if(e.hoursType==='40')return 40;if(e.hoursType==='custom')return parseFloat(e.customHours)||38;return 0}
 function getArea(id){return S.areas.find(a=>a.id===id)}
 function getEmp(id){return S.employees.find(e=>e.id===id)}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
-// Check if employee is on vacation for a specific week
-function isOnVacation(emp, weekStartISO){
-  const ws=new Date(weekStartISO+'T00:00:00');
-  const we=addDays(ws,6);
+// Controlla se il dipendente è in ferie in un GIORNO specifico
+// vacationOverrides[] contiene date in cui il giorno è stato sovrascritto manualmente
+// (es. assegnato un turno o riposo dentro un periodo ferie)
+function isOnVacationDay(emp, dateISO){
+  if((emp.vacationOverrides||[]).includes(dateISO))return false; // sovrascritto manualmente
+  const d=new Date(dateISO+'T00:00:00');
   return (emp.vacations||[]).some(v=>{
     if(!v.from||!v.to)return false;
     const vf=new Date(v.from+'T00:00:00');
     const vt=new Date(v.to+'T00:00:00');
-    return ws<=vt && we>=vf; // overlap check
+    return d>=vf && d<=vt;
+  });
+}
+
+// Controlla se il dipendente è in ferie per TUTTA la settimana (lun-dom)
+// Usata per escludere completamente un dipendente dalla generazione settimanale
+// solo se è in ferie ogni singolo giorno lavorativo della settimana
+function isOnVacation(emp, weekStartISO){
+  const ws=new Date(weekStartISO+'T00:00:00');
+  // Controlla i giorni aperti: se il dipendente è in ferie in TUTTI i giorni aperti → escludi
+  const openDaysOfWeek=DAYS_KEY.map((k,i)=>({k,i})).filter(({k})=>S.storeHours[k]&&S.storeHours[k].open);
+  if(!openDaysOfWeek.length) return false;
+  return openDaysOfWeek.every(({i})=>{
+    const dayDate=isoDate(addDays(ws,i));
+    return isOnVacationDay(emp,dayDate);
   });
 }
 
@@ -783,7 +812,26 @@ function renderStoreHours(){
 function toggleDayOpen(key,open){S.storeHours[key].open=open;const el=document.getElementById(`hd_${key}`);if(el){el.style.opacity=open?'1':'0.35';el.style.pointerEvents=open?'':'none'}save()}
 function setDayType(key,type){S.storeHours[key].type=type;['me_sep','me_inp','pm_block'].forEach(p=>{const el=document.getElementById(`${p}_${key}`);if(el)el.style.display=type==='continuous'?'none':''});save()}
 function setHour(key,field,val){S.storeHours[key][field]=val;save()}
-function saveStoreHours(){save();toast('Orari negozio salvati ✓')}
+function saveStoreHours(){
+  // Validazione: chiusura dopo apertura, pausa coerente
+  const errors=[];
+  DAYS_KEY.forEach((k,i)=>{
+    const sh=S.storeHours[k];
+    if(!sh||!sh.open)return;
+    if(sh.type==='split'){
+      if(t2m(sh.me)<=t2m(sh.ms))errors.push(`${DAYS_FULL[i]}: fine mattina prima dell'apertura`);
+      if(t2m(sh.as)<t2m(sh.me))errors.push(`${DAYS_FULL[i]}: inizio pomeriggio prima della fine mattina`);
+      if(t2m(sh.ae)<=t2m(sh.as))errors.push(`${DAYS_FULL[i]}: chiusura prima dell'inizio pomeriggio`);
+    } else {
+      if(t2m(sh.ae)<=t2m(sh.ms))errors.push(`${DAYS_FULL[i]}: chiusura prima o uguale all'apertura`);
+    }
+  });
+  if(errors.length){
+    toast('⚠️ Errori orari: '+errors[0]);
+    return;
+  }
+  save();toast('Orari negozio salvati ✓');
+}
 
 /* ═══════════════ GENERATE PAGE ═══════════════ */
 function renderGeneratePage(){
@@ -803,11 +851,29 @@ function saveCamionDays(){
 function updateWeekDisplay(){
   if(!S.currentWeekStart)return;
   document.getElementById('weekLabel').textContent=weekRange(S.currentWeekStart);
-  document.getElementById('weekPicker').value=S.currentWeekStart;
+  // type="week" expects "YYYY-Www"
+  const d=new Date(S.currentWeekStart+'T00:00:00');
+  const jan4=new Date(d.getFullYear(),0,4);
+  const startOfW1=new Date(jan4);
+  startOfW1.setDate(jan4.getDate()-((jan4.getDay()+6)%7));
+  const weekNum=Math.round((d-startOfW1)/(7*24*3600*1000))+1;
+  document.getElementById('weekPicker').value=`${d.getFullYear()}-W${String(weekNum).padStart(2,'0')}`;
 }
 function prevWeek(){const ws=new Date(S.currentWeekStart+'T00:00:00');ws.setDate(ws.getDate()-7);S.currentWeekStart=isoDate(ws);save();updateWeekDisplay()}
 function nextWeek(){const ws=new Date(S.currentWeekStart+'T00:00:00');ws.setDate(ws.getDate()+7);S.currentWeekStart=isoDate(ws);save();updateWeekDisplay()}
-function setWeekFromDate(v){if(!v)return;S.currentWeekStart=isoDate(getMonday(new Date(v+'T00:00:00')));save();updateWeekDisplay()}
+function setWeekFromPicker(v){
+  if(!v)return;
+  // v = "YYYY-Www"
+  const[yearStr,weekStr]=v.split('-W');
+  const year=parseInt(yearStr),week=parseInt(weekStr);
+  const jan4=new Date(year,0,4);
+  const startOfW1=new Date(jan4);
+  startOfW1.setDate(jan4.getDate()-((jan4.getDay()+6)%7));
+  const monday=new Date(startOfW1);
+  monday.setDate(startOfW1.getDate()+(week-1)*7);
+  S.currentWeekStart=isoDate(monday);
+  save();updateWeekDisplay();
+}
 
 /* ═══════════════ SCHEDULE GENERATION CORE ═══════════════ */
 // restHistory: {empId: dayKey} — last rest day each employee had (for rotation)
@@ -836,8 +902,8 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
   });
 
   // Fixed schedule employees — support biweekly A/B
-  const fixedEmps=avail.filter(e=>e.hoursType==='fixed');
-  const flexEmps =avail.filter(e=>e.hoursType!=='fixed');
+  const fixedEmps=avail.filter(e=>e.hoursType==='fixed'||e.isDirectore);
+  const flexEmps =avail.filter(e=>e.hoursType!=='fixed'&&!e.isDirectore);
 
   fixedEmps.forEach(emp=>{
     const hasBiweekly=emp.fixedScheduleB&&emp.fixedScheduleB.length>0;
@@ -912,6 +978,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       if(emp.isDirectore)return false;
       if((emp.daysOff||[]).includes(sunDate))return false;
       if((emp.permissionDays||[]).includes(sunDate))return false;
+      if(isOnVacationDay(emp,sunDate))return false; // ferie quel giorno
       return true;
     });
 
@@ -1026,12 +1093,43 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       if(sch.days[dayKey].dayOff.includes(emp.id))return false;
       if((emp.daysOff||[]).includes(dayDate))return false;
       if((emp.permissionDays||[]).includes(dayDate))return false;
-      if(emp.hoursType==='fixed')return false;
+      if(isOnVacationDay(emp,dayDate))return false; // ferie per questo giorno specifico
+      if(emp.hoursType==='fixed'||emp.isDirectore)return false; // direttore = solo tappabuchi
       return true;
     });
 
+    // ── DIRETTORE TAPPABUCHI (funzione) ──
+    // Il direttore copre le aree non-magazzino rimaste scoperte, max 3h/giorno,
+    // nei periodi in cui non è già in turno fisso. Domenica esclusa.
+    // Funziona anche quando non ci sono dipendenti flex disponibili (giorni scoperti).
+    function coverDirectorGaps(){
+      if(dayKey==='sun')return;
+      const directors=avail.filter(e=>e.isDirectore&&!isOnVacationDay(e,dayDate)&&!(e.daysOff||[]).includes(dayDate)&&!(e.permissionDays||[]).includes(dayDate));
+      directors.forEach(dir=>{
+        let dirCovMin=0;
+        const MAX_DIR_MIN=180; // max 3h/giorno
+        const periods=isSplit?[[t2m(sh.ms),t2m(sh.me)],[t2m(sh.as),t2m(sh.ae)]]:[[t2m(sh.ms),t2m(sh.ae)]];
+        periods.forEach(([pS,pE])=>{
+          if(dirCovMin>=MAX_DIR_MIN)return;
+          const dirBusy=sch.days[dayKey].shifts.some(s=>s.employeeId===dir.id&&t2m(s.startTime)<pE&&t2m(s.endTime)>pS);
+          if(dirBusy)return;
+          const uncoveredArea=nonMagAreas.find(a=>!sch.days[dayKey].shifts.some(s=>s.areaId===a.id&&t2m(s.startTime)<=pS&&t2m(s.endTime)>pS));
+          if(!uncoveredArea)return;
+          const remainMin=MAX_DIR_MIN-dirCovMin;
+          const covMin=Math.min(remainMin,pE-pS,3*60);
+          if(covMin<60)return;
+          const endM=pS+covMin;
+          const h=shiftH(m2t(pS),m2t(endM));
+          sch.days[dayKey].shifts.push({employeeId:dir.id,startTime:m2t(pS),endTime:m2t(endM),areaId:uncoveredArea.id,hours:h,directorGap:true});
+          worked[dir.id]=(worked[dir.id]||0)+h;
+          dirCovMin+=covMin;
+        });
+      });
+    }
+
     if(!working.length){
-      warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): nessun dipendente disponibile`);
+      coverDirectorGaps(); // il direttore può comunque tappare i buchi
+      warnings.push(`${DAYS_FULL[dayIdx]} (${weekRange(weekStartISO)}): nessun dipendente flex disponibile`);
       return;
     }
 
@@ -1194,7 +1292,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             if(sch.days[dayKey].shifts.some(s=>
               s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
             ))return false;
-            if(consecHAt(emp.id,cursor,dayKey)>4)return false;
+            if(consecHAt(emp.id,cursor,dayKey)>=6)return false;
             return empBudget(emp,cursor)>MIN_SHIFT_M/60;
           }).sort((a,b)=>{
             const profA=(isProfArea&&a.isProfumeria)?10:0;
@@ -1278,18 +1376,40 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       sortedW.forEach(emp=>{
         const maxH=empMaxH(emp);
         if(maxH<=0)return;
+        // ── CAP GIORNALIERO per distribuire le ore su tutta la settimana ──
+        // Conta i giorni lavorativi RIMANENTI (oggi incluso) in cui il dip. può lavorare:
+        // giorni aperti, non riposo, non ferie/assenza, da oggi in poi.
+        let remainingWorkDays=0;
+        const todayIdx=DAYS_KEY.indexOf(dayKey);
+        openDays.forEach(dk=>{
+          const dIdx=DAYS_KEY.indexOf(dk);
+          if(dIdx<todayIdx)return; // giorni passati nella settimana già processati
+          if(dk==='sun')return; // domenica gestita a parte
+          if(sch.days[dk].dayOff.includes(emp.id))return;
+          const dDate=isoDate(addDays(weekStart,dIdx));
+          if((emp.daysOff||[]).includes(dDate)||(emp.permissionDays||[]).includes(dDate)||isOnVacationDay(emp,dDate))return;
+          remainingWorkDays++;
+        });
+        const residualH=maxH-(worked[emp.id]||0);
+        // target giornaliero: distribuisce equamente le ore residue sui giorni rimanenti.
+        // Aggiunge un piccolo margine (1.15x) per assorbire arrotondamenti, ma cap a un turno pieno.
+        const dailyTarget=remainingWorkDays>0?Math.min(residualH/remainingWorkDays*1.15,residualH):residualH;
+        const workedTodayStart=DAYS_KEY.map(()=>0); // placeholder
         let cursor=pStartM;
         let _fillSafe=0; // safety counter anti-loop
         while(cursor<pEndM){
           if(++_fillSafe>2000)break; // max 2000 iterazioni per dipendente per periodo
-          const totalBudget=empBudget(emp,cursor);
+          // ore già assegnate oggi a questo dipendente
+          const todayH=sch.days[dayKey].shifts.filter(s=>s.employeeId===emp.id).reduce((s,x)=>s+(x.hours||0),0);
+          if(todayH>=dailyTarget-0.01)break; // raggiunto il target giornaliero: lascia ore per gli altri giorni
+          const totalBudget=Math.min(empBudget(emp,cursor),dailyTarget-todayH);
           if(totalBudget<=MIN_SHIFT_M/60)break;
           const act=sch.days[dayKey].shifts.find(s=>
             s.employeeId===emp.id&&t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           );
           if(act){cursor=t2m(act.endTime);continue;}
           const consec=consecHAt(emp.id,cursor,dayKey);
-          if(consec>4){cursor=Math.min(cursor+120,pEndM);continue;}
+          if(consec>=6){cursor=Math.min(cursor+120,pEndM);continue;}
           const concNow=sch.days[dayKey].shifts.filter(s=>
             t2m(s.startTime)<=cursor&&t2m(s.endTime)>cursor
           ).length;
@@ -1304,7 +1424,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             .filter(s=>s.employeeId===emp.id&&t2m(s.startTime)>cursor)
             .sort((a,b)=>t2m(a.startTime)-t2m(b.startTime))[0];
           const fCap=nxFut?t2m(nxFut.startTime)-120:pEndM;
-          const rawE=Math.min(cursor+totalBudget*60,cursor+maxCR*60,fCap,pEndM);
+          const rawE=Math.round(Math.min(cursor+totalBudget*60,cursor+maxCR*60,fCap,pEndM));
           if(rawE<=cursor){break;} // budget o consec azzerati: esci
           if(rawE-cursor<MIN_SHIFT_M){
             // frammento troppo corto per un nuovo turno
@@ -1357,6 +1477,9 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       if(isSplit)fillHours(sh.as,sh.ae);
     }
 
+    // ── d) DIRETTORE TAPPABUCHI ──
+    coverDirectorGaps();
+
     // ── Avvisi copertura ──
     // Non-mag sempre segnalate; mag segnalata solo se NESSUNA area è coperta
     S.areas.forEach(a=>{
@@ -1377,6 +1500,226 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       }
     });
   });
+
+  // ── PASSO 3: SATURAZIONE EQUA DELLE ORE CONTRATTUALI ──
+  // Priorità: riempire TUTTA la settimana saturando le ore contrattuali di OGNI dipendente
+  // prima di assegnare straordinari. Approccio round-robin: ad ogni ciclo serve il
+  // dipendente col maggior deficit, gli si aggiunge un blocco, poi si ricalcola.
+  // Questo evita che un dipendente vada in straordinario mentre altri restano in carenza.
+  const extendShiftTo=(dd,empId,newEndM)=>{
+    const myShifts=dd.shifts.filter(s=>s.employeeId===empId).sort((a,b)=>t2m(b.endTime)-t2m(a.endTime));
+    if(!myShifts.length)return 0;
+    const last=myShifts[0];
+    const oldEndM=t2m(last.endTime);
+    if(newEndM<=oldEndM)return 0;
+    const addedH=(newEndM-oldEndM)/60;
+    last.endTime=m2t(newEndM);
+    last.hours=(last.hours||0)+addedH;
+    return addedH;
+  };
+
+  // Prova ad aggiungere UN blocco di ore a un dipendente in UN giorno specifico.
+  // Ritorna ore aggiunte (0 se nulla). maxBlockH limita la dimensione del blocco
+  // per favorire la distribuzione su più giorni invece di saturare un giorno solo.
+  const tryAddBlock=(emp,dayKey,maxBlockH)=>{
+    if(dayKey==='sun')return 0;
+    const dd=sch.days[dayKey];
+    if(dd.dayOff.includes(emp.id))return 0;
+    const dayIdx2=DAYS_KEY.indexOf(dayKey);
+    const dayDate2=isoDate(addDays(weekStart,dayIdx2));
+    if((emp.daysOff||[]).includes(dayDate2)||(emp.permissionDays||[]).includes(dayDate2)||isOnVacationDay(emp,dayDate2))return 0;
+    const sh2=S.storeHours[dayKey];if(!sh2)return 0;
+    const dayClose=Math.min(t2m(sh2.ae),23*60+59);
+    const maxH=empMaxH(emp);
+    const residual=Math.max(0,maxH-(worked[emp.id]||0));
+    if(residual<=0.01)return 0;
+    const need=Math.round(Math.min(residual,maxBlockH)*60);
+    if(need<30)return 0;
+
+    // 1) estendi l'ultimo turno esistente del giorno (max 6h consecutive)
+    const myShifts=dd.shifts.filter(s=>s.employeeId===emp.id).sort((a,b)=>t2m(b.endTime)-t2m(a.endTime));
+    if(myShifts.length){
+      const last=myShifts[0];
+      const lastEndM=t2m(last.endTime);
+      const lastDurM=t2m(last.endTime)-t2m(last.startTime);
+      const consecRoom=Math.max(0,6*60-lastDurM);
+      const nextSh=dd.shifts.filter(s=>s.employeeId===emp.id&&t2m(s.startTime)>lastEndM).sort((a,b)=>t2m(a.startTime)-t2m(b.startTime))[0];
+      const capByNext=nextSh?t2m(nextSh.startTime)-lastEndM:(dayClose-lastEndM);
+      // non attraversare la pausa pranzo: se il negozio è split e il turno finisce
+      // entro la fine mattina, l'estensione si ferma a fine mattina (me)
+      let periodCapM=dayClose-lastEndM;
+      if(sh2.type==='split'&&lastEndM<=t2m(sh2.me)){periodCapM=t2m(sh2.me)-lastEndM;}
+      const room=Math.min(periodCapM,consecRoom,capByNext,need);
+      if(room>=30){
+        const addedH=extendShiftTo(dd,emp.id,lastEndM+room);
+        if(addedH>0){worked[emp.id]=(worked[emp.id]||0)+addedH;return addedH;}
+      }
+    }
+
+    // 2) aggiungi un nuovo turno in uno slot libero (rispetta pausa 2h, concorrenza)
+    const myDayShifts=dd.shifts.filter(s=>s.employeeId===emp.id).sort((a,b)=>t2m(a.startTime)-t2m(b.startTime));
+    // candidati di inizio: apertura mattina, inizio pomeriggio (se split),
+    // E il rientro dopo una pausa di 2h da ogni turno esistente del dipendente (per negozi continuati)
+    const startCandidates=sh2.type==='split'?[t2m(sh2.ms),t2m(sh2.as)]:[t2m(sh2.ms)];
+    myDayShifts.forEach(s=>{const after=t2m(s.endTime)+120;if(after<dayClose&&!startCandidates.includes(after))startCandidates.push(after);});
+    startCandidates.sort((a,b)=>a-b);
+    for(const stM of startCandidates){
+      if(myDayShifts.some(s=>stM<t2m(s.endTime)&&(stM+MIN_SHIFT_M)>t2m(s.startTime)))continue;
+      if(myDayShifts.some(s=>t2m(s.endTime)<=stM&&stM-t2m(s.endTime)<120))continue;
+      // non iniziare un turno prima dell'apertura
+      if(stM<t2m(sh2.ms))continue;
+      const periodEnd=(sh2.type==='split'&&stM<t2m(sh2.me))?t2m(sh2.me):dayClose;
+      const maxLen=Math.min(periodEnd-stM,6*60,need);
+      if(maxLen<MIN_SHIFT_M)continue;
+      if(S.maxConcurrentTotal){
+        const conc=dd.shifts.filter(s=>t2m(s.startTime)<=stM&&t2m(s.endTime)>stM).length;
+        if(conc>=S.maxConcurrentTotal)continue;
+      }
+      const endM=stM+maxLen;
+      const areaCnt={};S.areas.forEach(a=>{areaCnt[a.id]=dd.shifts.filter(s=>s.areaId===a.id).length});
+      let aId='';
+      if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA)aId=pA.id}
+      if(!aId){const free=S.areas.find(a=>!areaCnt[a.id]);aId=free?free.id:(S.areas[0]||{id:''}).id}
+      const h=shiftH(m2t(stM),m2t(endM));
+      dd.shifts.push({employeeId:emp.id,startTime:m2t(stM),endTime:m2t(endM),areaId:aId,hours:h});
+      worked[emp.id]=(worked[emp.id]||0)+h;
+      return h;
+    }
+    return 0;
+  };
+
+  // FASE A — SATURAZIONE distribuita: round-robin sul dipendente più carente,
+  // un blocco alla volta, provando i giorni in ordine di minor carico già assegnato.
+  // I dipendenti che non possono ricevere ore vengono ESCLUSI, senza fermare gli altri.
+  const blocked=new Set();
+  let saturGuard=0;
+  while(saturGuard++<2000){
+    const under=flexEmps.filter(e=>empMaxH(e)>0&&!blocked.has(e.id)&&(worked[e.id]||0)<empMaxH(e)-0.25)
+      .sort((a,b)=>(empMaxH(b)-(worked[b.id]||0))-(empMaxH(a)-(worked[a.id]||0)));
+    if(!under.length)break;
+    const emp=under[0];
+    // ordina i giorni lavorativi per ore già assegnate a questo dip. (meno carico prima → distribuzione)
+    const dayLoad=k=>{const dd=sch.days[k];return dd?dd.shifts.filter(s=>s.employeeId===emp.id).reduce((s,x)=>s+(x.hours||0),0):99};
+    const daysSorted=openDays.filter(k=>k!=='sun').sort((a,b)=>dayLoad(a)-dayLoad(b));
+    let added=0;
+    for(const dayKey of daysSorted){
+      if((worked[emp.id]||0)>=empMaxH(emp)-0.25)break;
+      // blocco massimo ~4h per favorire la distribuzione ma consentire rientri pomeridiani pieni
+      added+=tryAddBlock(emp,dayKey,4);
+      if(added>0.01)break; // un blocco alla volta, poi ripassa il round-robin
+    }
+    if(added<=0.01)blocked.add(emp.id); // questo dip non può ricevere altro: escludilo, NON fermare il resto
+  }
+
+  // FASE A-bis — RECUPERO RESIDUI: giro finale aggressivo. Per ogni dipendente ancora
+  // sotto contratto, tenta di aggiungere ore in OGNI giorno con blocchi pieni (fino a 6h),
+  // senza vincolo di distribuzione. Recupera i frammenti residui.
+  let recoverGuard=0;
+  let recovering=true;
+  while(recovering&&recoverGuard++<2000){
+    recovering=false;
+    flexEmps.forEach(emp=>{
+      if(empMaxH(emp)<=0)return;
+      if((worked[emp.id]||0)>=empMaxH(emp)-0.25)return;
+      for(const dayKey of openDays.filter(k=>k!=='sun')){
+        if((worked[emp.id]||0)>=empMaxH(emp)-0.25)break;
+        const got=tryAddBlock(emp,dayKey,6);
+        if(got>0.01){recovering=true;}
+      }
+    });
+  }
+
+  // ── PASSO 4: DIRETTORE SOSTITUISCE GLI STRAORDINARI ECCESSIVI ──
+  // Se un dipendente flex ha più di 3h di straordinario, il direttore subentra
+  // in quei turni extra: riduce il turno del flex e si aggiunge lui per coprire.
+  // Rispetta le regole del direttore: max 3h/giorno aggiuntive, domenica libera,
+  // non sovrapposto ai suoi turni fissi.
+  const OT_THRESHOLD=3; // h di straordinario tollerato prima dell'intervento direttore
+  const MAX_DIR_DAY_MIN=180; // max 3h tappabuchi/giorno per il direttore
+
+  const directors=avail.filter(e=>e.isDirectore);
+  if(directors.length>0){
+    directors.forEach(dir=>{
+      // Per ogni dipendente flex con straordinario > soglia
+      flexEmps.forEach(emp=>{
+        const contract=empMaxH(emp);
+        if(contract<=0)return;
+        const totalWorked=worked[emp.id]||0;
+        const totalOT=totalWorked-contract;
+        if(totalOT<=OT_THRESHOLD+0.1)return; // sotto soglia, lascia stare
+        let otToReplace=totalOT-OT_THRESHOLD; // ore da trasferire al direttore
+
+        // Scorre i giorni con turni oltre il contratto (partendo da quello con più ore)
+        const dayTotals=openDays.filter(k=>k!=='sun').map(k=>{
+          const h=sch.days[k].shifts.filter(s=>s.employeeId===emp.id).reduce((s,x)=>s+(x.hours||0),0);
+          return {k,h};
+        }).filter(x=>x.h>0).sort((a,b)=>b.h-a.h); // più carico prima
+
+        for(const {k:dayKey} of dayTotals){
+          if(otToReplace<=0.1)break;
+          if(dayKey==='sun')continue;
+
+          // Quante ore NON-fisse ha già il direttore oggi?
+          // Conta sia i tappabuchi area-scoperta (coverDirectorGaps) sia quelli del PASSO 4.
+          // Il turno fisso viene escluso perché non conta nel limite 3h tappabuchi.
+          const dirFixedToday=sch.days[dayKey].shifts
+            .filter(s=>s.employeeId===dir.id&&!s.directorGap).reduce((s,x)=>s+(x.hours||0),0);
+          const dirTotalToday=sch.days[dayKey].shifts
+            .filter(s=>s.employeeId===dir.id).reduce((s,x)=>s+(x.hours||0),0);
+          const dirGapToday=dirTotalToday-dirFixedToday; // ore tappabuchi oggi
+          const dirRoomMin=MAX_DIR_DAY_MIN-dirGapToday*60;
+          if(dirRoomMin<30)continue; // direttore già pieno questo giorno
+
+          // Trova il turno più lungo del flex in quel giorno (quello extra-contratto)
+          const empShiftsDay=sch.days[dayKey].shifts
+            .filter(s=>s.employeeId===emp.id)
+            .sort((a,b)=>(b.hours||0)-(a.hours||0));
+          if(!empShiftsDay.length)continue;
+
+          for(const shift of empShiftsDay){
+            if(otToReplace<=0.1)break;
+            // Quanto possiamo tagliare da questo turno?
+            // Taglia dalla coda: riduce endTime del turno del flex
+            const shiftH=shift.hours||0;
+            const minKeep=Math.max(MIN_SHIFT_M/60,0.5); // lascia almeno 30min
+            const cuttable=shiftH-minKeep; // max tagliabile
+            if(cuttable<=0.1)continue;
+
+            // Quanto tagliamo: min(da-rimpiazzare, tagliabile, room-direttore)
+            const cut=Math.min(otToReplace,cuttable,dirRoomMin/60);
+            if(cut<0.25)continue;
+
+            // Controlla che il direttore non sia già in turno in quell'orario
+            const cutStartM=t2m(shift.endTime)-Math.round(cut*60);
+            const cutEndM=t2m(shift.endTime);
+            const dirBusy=sch.days[dayKey].shifts.some(s=>
+              s.employeeId===dir.id&&t2m(s.startTime)<cutEndM&&t2m(s.endTime)>cutStartM
+            );
+            if(dirBusy)continue;
+
+            // Esegui il taglio: accorcia il turno del flex
+            const oldEnd=shift.endTime;
+            shift.endTime=m2t(cutStartM);
+            shift.hours=(shift.hours||0)-cut;
+            worked[emp.id]=(worked[emp.id]||0)-cut;
+
+            // Assegna il blocco tagliato al direttore
+            const areaId=shift.areaId||(S.areas[0]||{id:''}).id;
+            sch.days[dayKey].shifts.push({
+              employeeId:dir.id,
+              startTime:m2t(cutStartM),
+              endTime:oldEnd,
+              areaId,
+              hours:cut,
+              directorGap:true
+            });
+            worked[dir.id]=(worked[dir.id]||0)+cut;
+            otToReplace-=cut;
+          }
+        }
+      });
+    });
+  }
 
   // ── Avvisi straordinari ──
   flexEmps.forEach(e=>{
@@ -1447,8 +1790,11 @@ function doGenerate(){
   const warnings=[];
   const schedules=[];
   const restHistory={}; // {empId: dayKey} — tracks last rest day for rotation
+  // Forza il lunedì come inizio settimana (settimana standard lun→dom)
+  const baseMonday=getMonday(new Date(S.currentWeekStart+'T00:00:00'));
+  S.currentWeekStart=isoDate(baseMonday);
   for(let w=0;w<S.genWeekCount;w++){
-    const ws=addDays(new Date(S.currentWeekStart+'T00:00:00'),w*7);
+    const ws=addDays(baseMonday,w*7);
     const weekSch=generateWeekSchedule(isoDate(ws),warnings,restHistory,w);
     schedules.push(weekSch);
     // Update restHistory: record which day each employee rested this week
@@ -1500,7 +1846,7 @@ function showGenPreview(weekIdx){
 
   const ws=sch.weekStart;
   tbody.innerHTML=S.employees.map(emp=>{
-    if(isOnVacation(emp,ws))return `<tr><td><strong>${esc(emp.name)}</strong></td><td colspan="4"><span class="badge b-yellow">🏖 In ferie questa settimana</span></td></tr>`;
+    if(isOnVacation(emp,ws))return `<tr><td><strong>${esc(emp.name)}</strong></td><td colspan="4"><span class="badge b-yellow">🏖 Ferie intera settimana</span></td></tr>`;
     const max=empMaxH(emp);
     const w=Math.round((worked[emp.id]||0)*10)/10;
     const pct=max>0?Math.min((w/max)*100,100):0;
@@ -1521,6 +1867,106 @@ function showGenPreview(weekIdx){
   }).join('');
 }
 
+/* ═══════════════ CHECK ORARI ═══════════════ */
+// Calcola, per la settimana attualmente visualizzata, le ore effettive di ogni
+// dipendente confrontandole con il contratto: ore usate, straordinari, carenze.
+// Riflette eventuali modifiche manuali fatte sull'orario settimanale.
+function openCheckOrari(){
+  if(!S.weekSchedules.length){toast('Nessun orario generato');return}
+  if(S.currentViewSource!=='current'){toast('Disponibile solo sull\'orario corrente');return}
+  const idx=Math.min(S.currentViewWeekIdx,S.weekSchedules.length-1);
+  const sch=S.weekSchedules[idx];
+  const ws=new Date(sch.weekStart+'T00:00:00');
+
+  const rows=S.employees.map(emp=>{
+    // somma ore effettive dai turni di questa settimana
+    let totH=0;
+    DAYS_KEY.forEach((k,i)=>{
+      const dd=sch.days[k];if(!dd)return;
+      const dayShifts=(dd.shifts||[]).filter(s=>s.employeeId===emp.id);
+      dayShifts.forEach(s=>{totH+=s.hours||shiftH(s.startTime,s.endTime)});
+    });
+    totH=Math.round(totH*10)/10;
+    const contract=empMaxH(emp); // 0 = orario fisso
+
+    // Conta giorni aperti e giorni di ferie in questa settimana
+    const openDaysIdx=DAYS_KEY.map((k,i)=>({k,i})).filter(({k})=>S.storeHours[k]&&S.storeHours[k].open);
+    const vacDays=openDaysIdx.filter(({i})=>isOnVacationDay(emp,isoDate(addDays(ws,i)))).length;
+    const totalOpenDays=openDaysIdx.length;
+    const fullVacation=totalOpenDays>0&&vacDays>=totalOpenDays;
+    const partialVacation=vacDays>0&&vacDays<totalOpenDays;
+
+    let status,statusColor,extra='',effectiveContract=contract;
+
+    if(fullVacation){
+      status='🏖 In ferie';statusColor='#C0392B';extra='ferie intera settimana';
+      return {emp,totH,contract,effectiveContract:0,status,statusColor,extra,isVacation:true};
+    }
+
+    if(contract<=0){
+      status='Orario fisso';statusColor='#5D6D7E';extra=`${totH}h assegnate`;
+      return {emp,totH,contract,effectiveContract:0,status,statusColor,extra};
+    }
+
+    // Ferie parziale: riduci il contratto in proporzione ai giorni lavorabili
+    if(partialVacation&&totalOpenDays>0){
+      effectiveContract=Math.round((contract*(totalOpenDays-vacDays)/totalOpenDays)*10)/10;
+    }
+
+    const diff=Math.round((totH-effectiveContract)*10)/10;
+    if(diff>0.05){status=`+${diff}h straordinario`;statusColor='#E67E22';extra=partialVacation?`oltre contratto ridotto (${vacDays}gg ferie)`:'🔶 oltre contratto'}
+    else if(diff<-0.05){status=`${Math.abs(diff)}h in meno`;statusColor='#C0392B';extra=partialVacation?`carenza su contratto ridotto (${vacDays}gg ferie)`:'🔻 carenza'}
+    else{status='✓ Completo';statusColor='#1E8449';extra=partialVacation?`completo (${vacDays}gg ferie, contratto ${effectiveContract}h)`:'in linea col contratto'}
+    return {emp,totH,contract,effectiveContract,status,statusColor,extra,partialVacation,vacDays};
+  });
+
+  const tableRows=rows.map(r=>{
+    const contractLbl=r.isVacation?'<span style="color:#C0392B">Ferie</span>':(r.contract>0?(r.partialVacation?`${r.contract}h → ${r.effectiveContract}h`:`${r.contract}h`):'Fisso');
+    const cmpContract=r.effectiveContract>0?r.effectiveContract:r.contract;
+    const pct=cmpContract>0?Math.min((r.totH/cmpContract)*100,150):0;
+    const barColor=r.totH>cmpContract?'#E67E22':(r.totH<cmpContract*0.99?'#C0392B':'#1E8449');
+    return `<tr>
+      <td><strong>${esc(r.emp.name)}</strong></td>
+      <td>${contractLbl}</td>
+      <td><strong>${r.totH}h</strong>${cmpContract>0&&!r.isVacation?`<div class="hrs-bar" style="margin-top:3px"><div class="hrs-fill" style="width:${Math.min(pct,100)}%;background:${barColor}"></div></div>`:''}</td>
+      <td><span style="color:${r.statusColor};font-weight:700;font-size:12px">${r.status}</span></td>
+      <td class="text-xs text-muted">${r.extra}</td>
+    </tr>`;
+  }).join('');
+
+  // Totali aggregati (escludendo chi è in ferie intera settimana)
+  const totalOT=rows.reduce((s,r)=>{const cmp=r.effectiveContract>0?r.effectiveContract:r.contract;return s+(!r.isVacation&&cmp>0&&r.totH>cmp?(r.totH-cmp):0)},0);
+  const totalDeficit=rows.reduce((s,r)=>{const cmp=r.effectiveContract>0?r.effectiveContract:r.contract;return s+(!r.isVacation&&cmp>0&&r.totH<cmp?(cmp-r.totH):0)},0);
+  const totalWorked=rows.reduce((s,r)=>s+r.totH,0);
+
+  openModal(`
+    <div class="modal-header"><div class="modal-title">📊 Check Orari — Sett. ${idx+1} (${weekRange(sch.weekStart)})</div><button class="modal-close" onclick="closeModal()">×</button></div>
+    <div class="modal-body">
+      <div class="alert alert-info" style="margin-bottom:14px">Calcolo basato sull'orario attuale, incluse le modifiche manuali. Le ore sono la somma effettiva dei turni assegnati questa settimana.</div>
+      <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+        <div style="flex:1;min-width:120px;background:#F4F6F7;border-radius:6px;padding:10px;text-align:center">
+          <div style="font-size:20px;font-weight:700;color:var(--primary)">${Math.round(totalWorked*10)/10}h</div>
+          <div style="font-size:11px;color:var(--muted)">Ore totali assegnate</div>
+        </div>
+        <div style="flex:1;min-width:120px;background:#FEF0E0;border-radius:6px;padding:10px;text-align:center">
+          <div style="font-size:20px;font-weight:700;color:#E67E22">${Math.round(totalOT*10)/10}h</div>
+          <div style="font-size:11px;color:var(--muted)">Straordinari totali</div>
+        </div>
+        <div style="flex:1;min-width:120px;background:#FDEDEC;border-radius:6px;padding:10px;text-align:center">
+          <div style="font-size:20px;font-weight:700;color:#C0392B">${Math.round(totalDeficit*10)/10}h</div>
+          <div style="font-size:11px;color:var(--muted)">Carenze totali</div>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Dipendente</th><th>Contratto</th><th>Ore Assegnate</th><th>Stato</th><th>Note</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="closeModal()">Chiudi</button>
+    </div>`,true);
+}
+
 function clearSchedule(){
   confirm2('Cancellare tutti gli orari correnti?','Gli archivi salvati non vengono toccati.',()=>{
     S.weekSchedules=[];S.currentViewWeekIdx=0;S.currentViewSource='current';save();
@@ -1536,6 +1982,7 @@ function renderSchedule(){
   const title=document.getElementById('schTitle');
   const mwBar=document.getElementById('mwBar');
   const emergBtn=document.getElementById('emergencyBtn');
+  const checkBtn=document.getElementById('checkOrariBtn');
   const archiveBar=document.getElementById('archiveBar');
   const archiveSelect=document.getElementById('archiveSelect');
   const deleteArchBtn=document.getElementById('deleteArchiveBtn');
@@ -1568,10 +2015,11 @@ function renderSchedule(){
 
   if(!weekSchedules||!weekSchedules.length){
     el.innerHTML=`<div class="empty"><div class="empty-icon">📅</div><div class="empty-text">Nessun orario generato</div><div class="empty-sub">Vai in "Genera Orario" per creare l'orario settimanale</div></div>`;
-    mwBar.style.display='none';emergBtn.style.display='none';return;
+    mwBar.style.display='none';emergBtn.style.display='none';if(checkBtn)checkBtn.style.display='none';return;
   }
 
   emergBtn.style.display=isReadOnly?'none':'';
+  if(checkBtn)checkBtn.style.display='';
 
   const idx=Math.min(S.currentViewWeekIdx,weekSchedules.length-1);
   if(S.currentViewSource==='current')S.currentViewWeekIdx=idx;
@@ -1602,19 +2050,19 @@ function renderSchedule(){
   html+=`</tr></thead><tbody>`;
 
   emps.forEach(emp=>{
-    const onVac=isOnVacation(emp,sch.weekStart);
+    const onVacWeek=isOnVacation(emp,sch.weekStart); // in ferie TUTTA la settimana
     html+=`<tr><td class="emp-cell">
       <div class="emp-name">${esc(emp.name)}</div>
       <div style="font-size:10px;color:var(--muted);margin-top:2px">${empMaxH(emp)>0?empMaxH(emp)+'h/sett':'Orario fisso'}</div>
-      ${onVac?'<span class="badge b-red" style="font-size:9px;margin-top:3px">🏖 Ferie</span>':''}
+      ${onVacWeek?'<span class="badge b-red" style="font-size:9px;margin-top:3px">🏖 Ferie</span>':''}
     </td>`;
 
     DAYS_KEY.forEach((key,i)=>{
       const sh=S.storeHours[key];const closed=!sh||!sh.open;
       const dayDate=isoDate(addDays(ws,i));
       const dayData=sch.days[key];
+      const onVacDay=isOnVacationDay(emp,dayDate); // ferie QUEL giorno
 
-      if(onVac){html+=`<td><div class="day-cell is-vacation"><span class="cell-lbl" style="color:#922B21">Ferie</span></div></td>`;return}
       if(closed){html+=`<td><div class="day-cell is-closed"><span style="font-size:10px;color:#ADB5BD">Chiuso</span></div></td>`;return}
       if(!dayData){html+=`<td><div class="day-cell"></div></td>`;return}
 
@@ -1626,9 +2074,11 @@ function renderSchedule(){
       const clickFn=isReadOnly?'':`onclick="editShiftCell('${emp.id}','${key}',${idx})"`;
       const cursor=isReadOnly?'cursor:default':'';
 
-      if(isAbs){html+=`<td><div class="day-cell is-absence" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#721C24">Assenza</span></div></td>`;return}
-      if(isPerm){html+=`<td><div class="day-cell is-perm" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#0C5460">Permesso</span></div></td>`;return}
-      if(isOff){html+=`<td><div class="day-cell is-dayoff" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#856404">Riposo</span></div></td>`;return}
+      // Ferie: cliccabile per correzione manuale (mostra turni se ce ne sono dopo modifica manuale)
+      if(onVacDay&&!shifts.length){html+=`<td><div class="day-cell is-vacation" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#922B21">FERIE</span></div></td>`;return}
+      if(isAbs&&!shifts.length){html+=`<td><div class="day-cell is-absence" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#721C24">Assenza</span></div></td>`;return}
+      if(isPerm&&!shifts.length){html+=`<td><div class="day-cell is-perm" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#0C5460">Permesso</span></div></td>`;return}
+      if(isOff&&!shifts.length){html+=`<td><div class="day-cell is-dayoff" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#856404">Riposo</span></div></td>`;return}
 
       if(!shifts.length){
         html+=`<td><div class="day-cell" ${clickFn} style="${cursor}">${isReadOnly?'':' <div class="add-shift">+ Aggiungi</div>'}</div></td>`;
@@ -1639,7 +2089,8 @@ function renderSchedule(){
         const area=getArea(s.areaId);const color=area?area.color:'#3498DB';
         const otBadge=s.overtime?'<div class="badge-ot">📌 STRAORDINARIO</div>':'';
         const sunBadge=s.sundayFull?'<div class="badge-ot" style="background:#D6EAF8;color:#1B4F72">☀️ Turno domenica</div>':'';
-        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}${sunBadge}</div>`;
+        const gapBadge=s.directorGap?'<div class="badge-ot" style="background:#E8DAEF;color:#5B2C6F">🔧 Copertura direttore</div>':'';
+        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}${sunBadge}${gapBadge}</div>`;
       }).join('');
 
       html+=`<td><div class="day-cell" ${clickFn} style="${cursor}" ${!isReadOnly?'title="Clicca per modificare"':''}>${shiftsHtml}</div></td>`;
@@ -1680,13 +2131,14 @@ function deleteCurrentArchive(){
 }
 
 function cleanExpiredAbsences(){
-  const today=isoDate(new Date());
+  // Usa data locale, non UTC (isoDate usa toISOString che è UTC)
+  const now=new Date();
+  const today=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   let count=0;
   S.employees.forEach(e=>{
     const before=((e.daysOff||[]).length)+((e.permissionDays||[]).length);
     e.daysOff=(e.daysOff||[]).filter(d=>d>=today);
     e.permissionDays=(e.permissionDays||[]).filter(d=>d>=today);
-    // Also remove vacation periods fully in the past
     e.vacations=(e.vacations||[]).filter(v=>v.to>=today);
     const after=((e.daysOff||[]).length)+((e.permissionDays||[]).length);
     count+=before-after;
@@ -1703,45 +2155,84 @@ function editShiftCell(empId,dayKey,weekIdx){
   const sh=S.storeHours[dayKey];
   const sch=S.weekSchedules[weekIdx];
   const dayData=sch.days[dayKey];
+  const ws=new Date(sch.weekStart+'T00:00:00');
+  const dayDate=isoDate(addDays(ws,dayIdx));
   const isOff=dayData&&dayData.dayOff&&dayData.dayOff.includes(empId);
-  const shifts=(dayData&&dayData.shifts||[]).filter(s=>s.employeeId===empId);
-  const first=shifts[0];
-  const areaOpts=S.areas.map(a=>`<option value="${a.id}" ${first&&first.areaId===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
-  const defStart=sh?sh.ms:'09:00';const defEnd=sh?sh.ae:'17:00';
+  const onVac=isOnVacationDay(emp,dayDate);
+  const shifts=(dayData&&dayData.shifts||[]).filter(s=>s.employeeId===empId).sort((a,b)=>t2m(a.startTime)-t2m(b.startTime));
+  const s1=shifts[0],s2=shifts[1];
+  const hasSecond=!!s2;
+  const areaOpts=(sel)=>S.areas.map(a=>`<option value="${a.id}" ${sel===a.id?'selected':''}>${esc(a.name)}</option>`).join('');
+  const defStart=sh?sh.ms:'09:00';const defEnd=sh?(sh.type==='split'?sh.me:sh.ae):'13:00';
+  const defStart2=sh&&sh.type==='split'?sh.as:'15:30';const defEnd2=sh?sh.ae:'19:30';
 
   openModal(`
     <div class="modal-header"><div class="modal-title">Turno — ${esc(emp.name)} — ${DAYS_FULL[dayIdx]} (Sett.${weekIdx+1})</div><button class="modal-close" onclick="closeModal()">×</button></div>
     <div class="modal-body">
+      ${onVac?`<div class="alert alert-warning" style="margin-bottom:12px">🏖 Questo giorno è in <strong>periodo ferie</strong>. Assegnando un turno o un riposo, il giorno verrà escluso dalle ferie per questo dipendente.</div>`:''}
       <div class="check-group mb-16">
-        <label class="check-item"><input type="radio" name="stype" value="work" ${!isOff?'checked':''} onchange="toggleSTE('work')"> Turno lavorativo</label>
-        <label class="check-item"><input type="radio" name="stype" value="off"  ${isOff?'checked':''} onchange="toggleSTE('off')"> Giorno di riposo</label>
+        <label class="check-item"><input type="radio" name="stype" value="work" ${!isOff&&!onVac?'checked':''} onchange="toggleSTE('work')"> Turno lavorativo</label>
+        <label class="check-item"><input type="radio" name="stype" value="off"  ${isOff&&!onVac?'checked':''} onchange="toggleSTE('off')"> Giorno di riposo</label>
+        ${onVac?`<label class="check-item"><input type="radio" name="stype" value="vacation" checked onchange="toggleSTE('vacation')"> 🏖 Mantieni in ferie</label>`:''}
       </div>
-      <div id="workEditForm" ${isOff?'style="display:none"':''}>
-        <div class="form-grid mb-12">
-          <div class="form-group"><label class="form-label">Ora Inizio</label><input type="time" class="form-control" id="eStart" value="${first?first.startTime:defStart}"></div>
-          <div class="form-group"><label class="form-label">Ora Fine</label><input type="time" class="form-control" id="eEnd" value="${first?first.endTime:defEnd}"></div>
+      <div id="workEditForm" ${(isOff||onVac)?'style="display:none"':''}>
+        <div class="fs-label">🌅 Primo turno</div>
+        <div class="form-grid mb-8">
+          <div class="form-group"><label class="form-label">Ora Inizio</label><input type="time" class="form-control" id="eStart" value="${s1?s1.startTime:defStart}"></div>
+          <div class="form-group"><label class="form-label">Ora Fine</label><input type="time" class="form-control" id="eEnd" value="${s1?s1.endTime:defEnd}"></div>
         </div>
-        <div class="form-group"><label class="form-label">Area</label><select class="form-control" id="eArea">${areaOpts}</select></div>
+        <div class="form-group mb-12"><label class="form-label">Area</label><select class="form-control" id="eArea">${areaOpts(s1?s1.areaId:'')}</select></div>
+        <div class="mb-12">
+          <label class="check-item"><input type="checkbox" id="eSecondShift" ${hasSecond?'checked':''} onchange="toggleSecondShift()"> ➕ Aggiungi secondo turno (pomeriggio)</label>
+        </div>
+        <div id="secondShiftBlock" ${hasSecond?'':'style="display:none"'}>
+          <div class="fs-label">🌆 Secondo turno</div>
+          <div class="form-grid mb-8">
+            <div class="form-group"><label class="form-label">Ora Inizio</label><input type="time" class="form-control" id="eStart2" value="${s2?s2.startTime:defStart2}"></div>
+            <div class="form-group"><label class="form-label">Ora Fine</label><input type="time" class="form-control" id="eEnd2" value="${s2?s2.endTime:defEnd2}"></div>
+          </div>
+          <div class="form-group"><label class="form-label">Area</label><select class="form-control" id="eArea2">${areaOpts(s2?s2.areaId:'')}</select></div>
+        </div>
       </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal()">Annulla</button>
-      <button class="btn btn-primary" onclick="saveShiftEdit('${empId}','${dayKey}',${weekIdx})">Salva</button>
+      <button class="btn btn-primary" onclick="saveShiftEdit('${empId}','${dayKey}',${weekIdx},'${dayDate}')">Salva</button>
     </div>`);
 }
 function toggleSTE(val){const f=document.getElementById('workEditForm');if(f)f.style.display=val==='work'?'':'none'}
-function saveShiftEdit(empId,dayKey,weekIdx){
+function toggleSecondShift(){const b=document.getElementById('secondShiftBlock');if(b)b.style.display=document.getElementById('eSecondShift').checked?'':'none'}
+function saveShiftEdit(empId,dayKey,weekIdx,dayDate){
   const sch=S.weekSchedules[weekIdx];if(!sch)return;
   const type=document.querySelector('input[name="stype"]:checked');if(!type)return;
   const dd=sch.days[dayKey];
+  const emp=getEmp(empId);
+
+  // Se il tipo è "vacation" → mantieni in ferie, non fare nulla
+  if(type.value==='vacation'){closeModal();return}
+
   dd.dayOff=dd.dayOff.filter(id=>id!==empId);
   dd.shifts=dd.shifts.filter(s=>s.employeeId!==empId);
+
+  // Se il giorno era in ferie e ora assegniamo turno/riposo → registra override
+  if(dayDate&&emp&&isOnVacationDay(emp,dayDate)){
+    if(!emp.vacationOverrides)emp.vacationOverrides=[];
+    if(!emp.vacationOverrides.includes(dayDate))emp.vacationOverrides.push(dayDate);
+  }
+
   if(type.value==='off'){dd.dayOff.push(empId)}
   else{
-    const s=document.getElementById('eStart').value;const e=document.getElementById('eEnd').value;const a=document.getElementById('eArea').value;
+    const s=document.getElementById('eStart').value,e=document.getElementById('eEnd').value,a=document.getElementById('eArea').value;
     if(s&&e&&t2m(e)>t2m(s))dd.shifts.push({employeeId:empId,startTime:s,endTime:e,areaId:a,hours:shiftH(s,e)});
+    if(document.getElementById('eSecondShift')&&document.getElementById('eSecondShift').checked){
+      const s2=document.getElementById('eStart2').value,e2=document.getElementById('eEnd2').value,a2=document.getElementById('eArea2').value;
+      if(s2&&e2&&t2m(e2)>t2m(s2)){
+        if(s&&e&&t2m(s2)<t2m(e)){toast('⚠️ Il secondo turno si sovrappone al primo');return}
+        dd.shifts.push({employeeId:empId,startTime:s2,endTime:e2,areaId:a2,hours:shiftH(s2,e2)});
+      }
+    }
   }
-  save();closeModal();renderSchedule();
+  save();closeModal();renderSchedule();renderEmployees();
 }
 
 /* ═══════════════ ASSENZA URGENTE ═══════════════ */
@@ -1907,16 +2398,25 @@ function applyEmergency(weekIdx){
   removedShifts.forEach((s,i)=>{
     const substId=document.getElementById(`cover_${i}`)?.value;
     if(substId&&substId!==empId){
+      const substEmp=getEmp(substId);
       // Rimuovi sostituto da dayOff se era in riposo
       dayData.dayOff=dayData.dayOff.filter(id=>id!==substId);
-      // Aggiungi turno sostituto
+      // Calcola ore già lavorate dal sostituto questa settimana per marcare straordinario
+      let substWeekH=0;
+      DAYS_KEY.forEach(dk=>{
+        (sch.days[dk]&&sch.days[dk].shifts||[]).forEach(sh=>{if(sh.employeeId===substId)substWeekH+=sh.hours||0});
+      });
+      const newShiftH=shiftH(s.startTime,s.endTime);
+      const contract=substEmp?empMaxH(substEmp):0;
+      const isOT=contract>0&&(substWeekH+newShiftH)>contract;
       dayData.shifts.push({
         employeeId:substId,
         startTime:s.startTime,
         endTime:s.endTime,
         areaId:s.areaId,
-        hours:shiftH(s.startTime,s.endTime),
-        isSubstitute:true // flag per eventuale visualizzazione futura
+        hours:newShiftH,
+        isSubstitute:true,
+        overtime:isOT||undefined
       });
     }
   });
@@ -2284,7 +2784,7 @@ function confirmRefreshEmp(empId){
   if(!S.weekSchedules||!S.weekSchedules.length){toast('Nessun orario generato');return}
   confirm2(
     `Aggiorna orario di "${emp.name}"?`,
-    `Rigenera i turni per tutte le ${S.weekSchedules.length} settimane. Gli altri dipendenti non vengono toccati.`,
+    `Rigenera i turni di questo dipendente per tutte le ${S.weekSchedules.length} settimane (logica semplificata: non applica la regola domenica a 3 persone). Per orari ottimali rigenera l'intera settimana. Gli altri dipendenti non vengono toccati.`,
     ()=>refreshEmpSchedule(empId)
   );
 }
@@ -2370,27 +2870,41 @@ function refreshEmpSchedule(empId){
         const dayIdx=DAYS_KEY.indexOf(dayKey);
         const dayDate=isoDate(addDays(weekStart,dayIdx));
         const sh=S.storeHours[dayKey];
-        if((emp.daysOff||[]).includes(dayDate)||(emp.permissionDays||[]).includes(dayDate)){
+        // ferie per giorno specifico / assenze / permessi
+        if((emp.daysOff||[]).includes(dayDate)||(emp.permissionDays||[]).includes(dayDate)||isOnVacationDay(emp,dayDate)){
           if(!sch.days[dayKey].dayOff.includes(empId))sch.days[dayKey].dayOff.push(empId);
+          return;
+        }
+        // DOMENICA: turno completo apertura→chiusura (coerente con regola 3 persone)
+        if(dayKey==='sun'){
+          const sunStart=sh.ms,sunEnd=sh.ae;
+          const sunH=shiftH(sunStart,sunEnd);
+          const areaCountS={};S.areas.forEach(a=>{areaCountS[a.id]=sch.days[dayKey].shifts.filter(s=>s.areaId===a.id).length});
+          let sunArea=S.areas.find(a=>!areaCountS[a.id])||S.areas[0]||{id:''};
+          const isOTSun=maxH>0&&(workedH+sunH)>maxH;
+          sch.days[dayKey].shifts.push({employeeId:empId,startTime:sunStart,endTime:sunEnd,areaId:sunArea.id,hours:sunH,sundayFull:true,overtime:isOTSun||undefined});
+          workedH+=sunH;
           return;
         }
         const remaining=maxH>0?maxH-workedH:8;
         if(remaining<=0.1)return;
         const totalH=dayH(sh);
         const availH=Math.min(remaining,totalH);
-        const startTime=emp.takesMorningDelivery?'07:00':sh.ms;
+        // camion 07:00 solo nei giorni con consegna configurati
+        const isCamionDay=!!(S.camionDays&&S.camionDays[dayKey]);
+        const startTime=(emp.takesMorningDelivery&&isCamionDay&&t2m(sh.ms)>t2m('07:00'))?'07:00':sh.ms;
         const endTime=m2t(Math.min(t2m(startTime)+availH*60,t2m(sh.ae)));
         const actualH=shiftH(startTime,endTime);
         if(actualH<MIN_SHIFT_M/60)return;
-        // Global max concurrent check
         if(S.maxConcurrentTotal&&sch.days[dayKey].shifts.length>=S.maxConcurrentTotal)return;
-        // Find uncovered area respecting per-area maxConcurrent
         const areaCountR={};S.areas.forEach(a=>{areaCountR[a.id]=sch.days[dayKey].shifts.filter(s=>s.areaId===a.id).length});
         const areaFitsR=a=>{const mc=a.maxConcurrent;return !mc||(areaCountR[a.id]||0)<mc};
         let areaId='';
         if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA&&areaFitsR(pA))areaId=pA.id}
         if(!areaId){const unc=S.areas.find(a=>!areaCountR[a.id]&&areaFitsR(a));areaId=unc?unc.id:(S.areas.find(a=>areaFitsR(a))||S.areas[0]||{id:''}).id}
-        sch.days[dayKey].shifts.push({employeeId:empId,startTime,endTime,areaId,hours:actualH});
+        const base=empMaxH(emp);
+        const isOT=base>0&&(workedH+actualH)>base;
+        sch.days[dayKey].shifts.push({employeeId:empId,startTime,endTime,areaId,hours:actualH,overtime:isOT||undefined});
         workedH+=actualH;
       });
     }
