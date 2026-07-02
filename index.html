@@ -644,7 +644,7 @@ function applyParsedState(p){
   if(!S.weekSchedules)S.weekSchedules=[];
   if(!S.archivedSchedules)S.archivedSchedules=[];
   if(!S.currentViewSource)S.currentViewSource='current';
-  (S.employees||[]).forEach(e=>{if(!e.vacations)e.vacations=[];if(!e.vacationOverrides)e.vacationOverrides=[]});
+  (S.employees||[]).forEach(e=>{if(!e.vacations)e.vacations=[];if(!e.vacationOverrides)e.vacationOverrides=[];if(!e.weekPreferences)e.weekPreferences=[]});
   // Normalizza currentWeekStart al lunedì (settimana standard lun→dom)
   if(S.currentWeekStart){
     const norm=isoDate(getMonday(new Date(S.currentWeekStart+'T00:00:00')));
@@ -905,6 +905,67 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
   const fixedEmps=avail.filter(e=>e.hoursType==='fixed'||e.isDirectore);
   const flexEmps =avail.filter(e=>e.hoursType!=='fixed'&&!e.isDirectore);
 
+  // ── PASSO 0: PREFERENZE DIPENDENTI ──
+  // I dipendenti possono indicare, per una settimana specifica, un giorno di riposo
+  // preferito oppure un giorno + fascia oraria in cui preferiscono lavorare.
+  // Il sistema tenta di accontentarle nei limiti dei vincoli operativi (orari negozio,
+  // ferie/assenze, ore consecutive, turno minimo); se non è possibile la preferenza
+  // viene ignorata e segnalata negli avvisi. Si applica solo ai dipendenti flex.
+  const prefRestDayMap={};      // empId -> giorno di riposo preferito
+  const prefWorkDayMap={};      // empId -> giorno in cui è stato pre-assegnato un turno preferito
+  const prefWorkSundaySet=new Set(); // empId che preferiscono lavorare domenica
+  flexEmps.forEach(emp=>{
+    const pref=(emp.weekPreferences||[]).find(p=>p.weekStart===weekStartISO);
+    if(!pref)return;
+    if(pref.type==='rest'&&pref.day){prefRestDayMap[emp.id]=pref.day;return}
+    if(pref.type!=='work'||!pref.day)return;
+    if(pref.day==='sun'){prefWorkSundaySet.add(emp.id);return}
+
+    // Turno preferito infrasettimanale: pre-assegna PRIMA della copertura automatica,
+    // così l'algoritmo tiene già conto di queste ore nel bilancio del dipendente.
+    const dayKey=pref.day;
+    const dayIdxP=DAYS_KEY.indexOf(dayKey);
+    if(!openDays.includes(dayKey)){
+      warnings.push(`⭐ Preferenza ${emp.name}: negozio chiuso ${DAYS_FULL[dayIdxP]}, non applicata.`);
+      return;
+    }
+    const dayDateP=isoDate(addDays(weekStart,dayIdxP));
+    if((emp.daysOff||[]).includes(dayDateP)||(emp.permissionDays||[]).includes(dayDateP)||isOnVacationDay(emp,dayDateP)){
+      warnings.push(`⭐ Preferenza ${emp.name}: assente il ${DAYS_FULL[dayIdxP]}, non applicata.`);
+      return;
+    }
+    const sh0=S.storeHours[dayKey];
+    if(!sh0||!sh0.open)return;
+    const reqS=t2m(pref.startTime||sh0.ms), reqE=t2m(pref.endTime||sh0.ae);
+    if(reqE<=reqS){warnings.push(`⭐ Preferenza ${emp.name}: orario non valido, non applicata.`);return}
+    const periods=sh0.type==='split'?[[t2m(sh0.ms),t2m(sh0.me)],[t2m(sh0.as),t2m(sh0.ae)]]:[[t2m(sh0.ms),t2m(sh0.ae)]];
+    const maxHp=empMaxH(emp);
+    let placed=false;
+    for(const [pS,pE] of periods){
+      if(maxHp>0&&(worked[emp.id]||0)>=maxHp-0.1)break;
+      const s=Math.max(pS,reqS), e=Math.min(pE,reqE);
+      if(e-s<MIN_SHIFT_M)continue;
+      let durM=Math.min(e-s,6*60); // rispetta il max 6h consecutive
+      if(maxHp>0){const remainM=Math.round((maxHp-(worked[emp.id]||0))*60);durM=Math.min(durM,Math.max(remainM,0));}
+      if(durM<MIN_SHIFT_M)continue;
+      const endM=s+durM;
+      if(S.maxConcurrentTotal){
+        const conc=sch.days[dayKey].shifts.filter(x=>t2m(x.startTime)<=s&&t2m(x.endTime)>s).length;
+        if(conc>=S.maxConcurrentTotal)continue;
+      }
+      const areaCnt={};S.areas.forEach(a=>{areaCnt[a.id]=sch.days[dayKey].shifts.filter(x=>x.areaId===a.id).length});
+      let aId='';
+      if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA)aId=pA.id}
+      if(!aId){const free=S.areas.find(a=>!areaCnt[a.id]);aId=free?free.id:(S.areas[0]||{id:''}).id}
+      const h=shiftH(m2t(s),m2t(endM));
+      sch.days[dayKey].shifts.push({employeeId:emp.id,startTime:m2t(s),endTime:m2t(endM),areaId:aId,hours:h,preferred:true});
+      worked[emp.id]=(worked[emp.id]||0)+h;
+      placed=true;
+    }
+    if(placed)prefWorkDayMap[emp.id]=dayKey;
+    else warnings.push(`⭐ Preferenza ${emp.name} (${DAYS_FULL[dayIdxP]} ${pref.startTime||''}-${pref.endTime||''}): non compatibile con l'orario negozio, non applicata.`);
+  });
+
   fixedEmps.forEach(emp=>{
     const hasBiweekly=emp.fixedScheduleB&&emp.fixedScheduleB.length>0;
     let activeSchedule=emp.fixedSchedule||[];
@@ -983,7 +1044,11 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     });
 
     // Rotazione: penalizza chi ha lavorato domenica più di recente
+    // + boost preferenze: chi preferisce lavorare domenica va avanti, chi preferisce riposarci va indietro
     const sorted=[...sunCandidates].sort((a,b)=>{
+      const boostA=(prefWorkSundaySet.has(a.id)?-1000:0)+(prefRestDayMap[a.id]==='sun'?1000:0);
+      const boostB=(prefWorkSundaySet.has(b.id)?-1000:0)+(prefRestDayMap[b.id]==='sun'?1000:0);
+      if(boostA!==boostB)return boostA-boostB;
       const lastA=restHistory['sun_'+a.id]||(-1);
       const lastB=restHistory['sun_'+b.id]||(-1);
       if(lastA!==lastB)return lastA-lastB;
@@ -1030,9 +1095,21 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
         const noCamion=pool.filter(d=>!(S.camionDays&&S.camionDays[d]));
         if(noCamion.length>0)pool=noCamion; // usa solo giorni non-camion; se vuoto lascia il pool intero
       }
+      // Escludi il giorno in cui è stato pre-assegnato un turno preferito (non può riposarci)
+      const prefWD=prefWorkDayMap[emp.id];
+      if(prefWD&&pool.includes(prefWD)&&pool.length>1){
+        pool=pool.filter(d=>d!==prefWD);
+      }
+      // Riposo preferito: priorità forte se il giorno è disponibile nel pool
+      const prefRD=prefRestDayMap[emp.id];
+      if(prefRD&&prefRD!=='sun'&&!pool.includes(prefRD)){
+        warnings.push(`⭐ Riposo preferito di ${emp.name} (${DAYS_FULL[DAYS_KEY.indexOf(prefRD)]}) non disponibile questa settimana, assegnato un altro giorno.`);
+      }
       const sorted2=[...pool].sort((a,b)=>{
-        const penA=(a===lastRest?100:0)+(restCount[a]||0);
-        const penB=(b===lastRest?100:0)+(restCount[b]||0);
+        const prefA=(prefRD&&a===prefRD)?-1000:0;
+        const prefB=(prefRD&&b===prefRD)?-1000:0;
+        const penA=prefA+(a===lastRest?100:0)+(restCount[a]||0);
+        const penB=prefB+(b===lastRest?100:0)+(restCount[b]||0);
         if(penA!==penB)return penA-penB;
         return restPref.indexOf(a)-restPref.indexOf(b);
       });
@@ -2098,7 +2175,8 @@ function renderSchedule(){
         const otBadge=s.overtime?'<div class="badge-ot">📌 STRAORDINARIO</div>':'';
         const sunBadge=s.sundayFull?'<div class="badge-ot" style="background:#D6EAF8;color:#1B4F72">☀️ Turno domenica</div>':'';
         const gapBadge=s.directorGap?'<div class="badge-ot" style="background:#E8DAEF;color:#5B2C6F">🔧 Copertura direttore</div>':'';
-        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}${sunBadge}${gapBadge}</div>`;
+        const prefBadge=s.preferred?'<div class="badge-ot" style="background:#FCF3CF;color:#7D6608">⭐ Preferenza</div>':'';
+        return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}${sunBadge}${gapBadge}${prefBadge}</div>`;
       }).join('');
 
       html+=`<td><div class="day-cell" ${clickFn} style="${cursor}" ${!isReadOnly?'title="Clicca per modificare"':''}>${shiftsHtml}</div></td>`;
@@ -2435,7 +2513,7 @@ function applyEmergency(weekIdx){
 }
 
 /* ═══════════════ EMPLOYEE MODAL ═══════════════ */
-let _fsIdx=0,_fsBIdx=0,_vacIdx=0;
+let _fsIdx=0,_fsBIdx=0,_vacIdx=0,_prefIdx=0;
 function openEmpModal(id){
   const emp=id?getEmp(id):null;const edit=!!emp;
   const cc=(emp&&emp.customChars||[]).join(', ');
@@ -2445,6 +2523,7 @@ function openEmpModal(id){
   const bwFirstA=(emp&&emp.biweeklyFirstWeek)==='B'?'':'checked';
   const bwFirstB=(emp&&emp.biweeklyFirstWeek)==='B'?'checked':'';
   const vacRows=(emp&&emp.vacations||[]).map((v,i)=>buildVacRow(v,i)).join('');
+  const prefRows=(emp&&emp.weekPreferences||[]).map((p,i)=>buildPrefRow(p,i)).join('');
 
   openModal(`
     <div class="modal-header"><div class="modal-title">${edit?'Modifica Dipendente':'Nuovo Dipendente'}</div><button class="modal-close" onclick="closeModal()">×</button></div>
@@ -2520,6 +2599,15 @@ function openEmpModal(id){
 
       <div class="divider"></div>
 
+      <div class="form-group mb-12">
+        <label class="form-label">⭐ Preferenze Settimanali</label>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Il dipendente può richiedere un giorno di riposo preferito, oppure un giorno e una fascia oraria in cui preferisce lavorare, per una settimana specifica tra quelle generate. Il sistema proverà ad accontentarla compatibilmente con le esigenze del negozio (non garantito). Non si applica a direttore/orario fisso.</div>
+        <div id="prefRows">${prefRows}</div>
+        <button class="btn btn-secondary btn-sm mt-8" type="button" onclick="addPrefRow()">+ Aggiungi Preferenza</button>
+      </div>
+
+      <div class="divider"></div>
+
       <div class="form-grid">
         <div class="form-group">
           <label class="form-label">Giorni Assenza/Ferie singoli (una data per riga, AAAA-MM-GG)</label>
@@ -2555,6 +2643,60 @@ function addVacRow(){
   c.appendChild(d.firstElementChild);
 }
 function rmVacRow(idx){const r=document.getElementById(`vr_${idx}`);if(r)r.remove()}
+
+function buildPrefRow(p,idx){
+  const dayOpts=DAYS_KEY.map((k,i)=>`<option value="${k}" ${p.day===k?'selected':''}>${DAYS_FULL[i]}</option>`).join('');
+  const isWork=p.type==='work';
+  return `<div class="pref-row" id="prr_${idx}" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
+    <div class="form-grid mb-8">
+      <div class="form-group"><label class="form-label">Settimana (una data qualsiasi in quella settimana)</label><input type="date" class="form-control" id="pw_${idx}" value="${p.weekStart||''}"></div>
+      <div class="form-group"><label class="form-label">Giorno</label><select class="form-control" id="pd_${idx}">${dayOpts}</select></div>
+    </div>
+    <div class="check-group mb-8">
+      <label class="check-item"><input type="radio" name="pt_${idx}" value="rest" ${!isWork?'checked':''} onchange="togglePrefType('${idx}')"> 😴 Riposo preferito</label>
+      <label class="check-item"><input type="radio" name="pt_${idx}" value="work" ${isWork?'checked':''} onchange="togglePrefType('${idx}')"> ⭐ Preferisce lavorare</label>
+    </div>
+    <div id="prTimeBlock_${idx}" class="form-grid mb-8" ${isWork?'':'style="display:none"'}>
+      <div class="form-group"><label class="form-label">Dalle</label><input type="time" class="form-control" id="ps_${idx}" value="${p.startTime||''}"></div>
+      <div class="form-group"><label class="form-label">Alle</label><input type="time" class="form-control" id="pe_${idx}" value="${p.endTime||''}"></div>
+    </div>
+    <div class="form-group mb-8"><label class="form-label">Nota (opz.)</label><input type="text" class="form-control" id="pn_${idx}" value="${esc(p.note||'')}" placeholder="Es. visita medica"></div>
+    <button class="btn btn-danger btn-sm" type="button" onclick="rmPrefRow('${idx}')">× Rimuovi</button>
+  </div>`;
+}
+function togglePrefType(idx){
+  const sel=document.querySelector(`input[name="pt_${idx}"]:checked`);
+  const val=sel?sel.value:'rest';
+  const b=document.getElementById(`prTimeBlock_${idx}`);
+  if(b)b.style.display=val==='work'?'':'none';
+}
+function addPrefRow(){
+  _prefIdx++;
+  const c=document.getElementById('prefRows');
+  const d=document.createElement('div');
+  d.innerHTML=buildPrefRow({weekStart:'',type:'rest',day:'mon',startTime:'',endTime:'',note:''},'p'+_prefIdx);
+  c.appendChild(d.firstElementChild);
+}
+function rmPrefRow(idx){const r=document.getElementById(`prr_${idx}`);if(r)r.remove()}
+function collectPreferences(){
+  return Array.from(document.querySelectorAll('#prefRows .pref-row')).map(row=>{
+    const i=row.id.replace('prr_','');
+    const wRaw=document.getElementById(`pw_${i}`).value;
+    if(!wRaw)return null;
+    const weekStart=isoDate(getMonday(new Date(wRaw+'T00:00:00')));
+    const day=document.getElementById(`pd_${i}`).value;
+    const typeSel=document.querySelector(`input[name="pt_${i}"]:checked`);
+    const type=typeSel?typeSel.value:'rest';
+    const note=document.getElementById(`pn_${i}`).value.trim();
+    if(type==='work'){
+      const startTime=document.getElementById(`ps_${i}`).value;
+      const endTime=document.getElementById(`pe_${i}`).value;
+      if(!startTime||!endTime||startTime>=endTime)return null;
+      return {weekStart,type,day,startTime,endTime,note};
+    }
+    return {weekStart,type,day,note};
+  }).filter(Boolean);
+}
 
 function buildFsRow(fs,idx){
   const dayOpts=DAYS_KEY.map((k,i)=>`<option value="${k}" ${fs.day===k?'selected':''}>${DAYS_FULL[i]}</option>`).join('');
@@ -2767,6 +2909,7 @@ function saveEmp(existId){
     takesMorningDelivery:document.getElementById('eCamion').checked,
     customChars:cc,
     vacations:collectVacations(),
+    weekPreferences:collectPreferences(),
     daysOff:parseLines('eDaysOff'),
     permissionDays:parseLines('ePermDays')
   };
@@ -2855,6 +2998,8 @@ function refreshEmpSchedule(empId){
       // Flex employee — pick rest day (rotate, prefer less-crowded days)
       const restCount={};
       openDays.forEach(d=>{restCount[d]=(sch.days[d].dayOff||[]).filter(id=>id!==empId).length});
+      const prefThisWeek=(emp.weekPreferences||[]).find(p=>p.weekStart===weekStartISO);
+      const prefRestDay=(prefThisWeek&&prefThisWeek.type==='rest'&&prefThisWeek.day)?prefThisWeek.day:null;
       let restDay;
       if(emp.isDirectore&&openDays.includes('sun')){
         restDay='sun';
@@ -2867,8 +3012,10 @@ function refreshEmpSchedule(empId){
           if(noCam.length>0)restPool=noCam;
         }
         const sortedForRest=[...restPool].sort((a,b)=>{
-          const penA=(a===lastRest?100:0)+(restCount[a]||0);
-          const penB=(b===lastRest?100:0)+(restCount[b]||0);
+          const prefA=(prefRestDay&&a===prefRestDay)?-1000:0;
+          const prefB=(prefRestDay&&b===prefRestDay)?-1000:0;
+          const penA=prefA+(a===lastRest?100:0)+(restCount[a]||0);
+          const penB=prefB+(b===lastRest?100:0)+(restCount[b]||0);
           if(penA!==penB)return penA-penB;
           return restPrefLocal.indexOf(a)-restPrefLocal.indexOf(b);
         });
@@ -2880,6 +3027,39 @@ function refreshEmpSchedule(empId){
       // Assign shifts on working days
       const maxH=empMaxH(emp);
       let workedH=0;
+
+      // ── Turno preferito infrasettimanale: pre-assegna prima del riempimento normale ──
+      let prefWorkDay=null;
+      if(prefThisWeek&&prefThisWeek.type==='work'&&prefThisWeek.day&&prefThisWeek.day!=='sun'&&prefThisWeek.day!==restDay&&openDays.includes(prefThisWeek.day)){
+        const dayKeyP=prefThisWeek.day;
+        const dayDateP=isoDate(addDays(weekStart,DAYS_KEY.indexOf(dayKeyP)));
+        const okAbsence=!(emp.daysOff||[]).includes(dayDateP)&&!(emp.permissionDays||[]).includes(dayDateP)&&!isOnVacationDay(emp,dayDateP);
+        const shP=S.storeHours[dayKeyP];
+        if(okAbsence&&shP&&shP.open){
+          const reqS=t2m(prefThisWeek.startTime||shP.ms), reqE=t2m(prefThisWeek.endTime||shP.ae);
+          if(reqE>reqS){
+            const periodsP=shP.type==='split'?[[t2m(shP.ms),t2m(shP.me)],[t2m(shP.as),t2m(shP.ae)]]:[[t2m(shP.ms),t2m(shP.ae)]];
+            for(const [pS,pE] of periodsP){
+              if(maxH>0&&workedH>=maxH-0.1)break;
+              const s=Math.max(pS,reqS), e=Math.min(pE,reqE);
+              if(e-s<MIN_SHIFT_M)continue;
+              let durM=Math.min(e-s,6*60);
+              if(maxH>0){const remainM=Math.round((maxH-workedH)*60);durM=Math.min(durM,Math.max(remainM,0));}
+              if(durM<MIN_SHIFT_M)continue;
+              const endM=s+durM;
+              const areaCntP={};S.areas.forEach(a=>{areaCntP[a.id]=sch.days[dayKeyP].shifts.filter(x=>x.areaId===a.id).length});
+              let aIdP='';
+              if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA)aIdP=pA.id}
+              if(!aIdP){const free=S.areas.find(a=>!areaCntP[a.id]);aIdP=free?free.id:(S.areas[0]||{id:''}).id}
+              const hP=shiftH(m2t(s),m2t(endM));
+              sch.days[dayKeyP].shifts.push({employeeId:empId,startTime:m2t(s),endTime:m2t(endM),areaId:aIdP,hours:hP,preferred:true});
+              workedH+=hP;
+            }
+            prefWorkDay=dayKeyP;
+          }
+        }
+      }
+
       openDays.forEach(dayKey=>{
         if(dayKey===restDay)return;
         const dayIdx=DAYS_KEY.indexOf(dayKey);
@@ -2899,6 +3079,34 @@ function refreshEmpSchedule(empId){
           const isOTSun=maxH>0&&(workedH+sunH)>maxH;
           sch.days[dayKey].shifts.push({employeeId:empId,startTime:sunStart,endTime:sunEnd,areaId:sunArea.id,hours:sunH,sundayFull:true,overtime:isOTSun||undefined});
           workedH+=sunH;
+          return;
+        }
+        // GIORNO CON PREFERENZA GIÀ PRE-ASSEGNATA: riempi solo i periodi NON coperti
+        // dalla preferenza (es. se ha chiesto solo il pomeriggio, la mattina va comunque
+        // riempita normalmente), rispettando la pausa pranzo se il negozio è split.
+        if(dayKey===prefWorkDay){
+          if(maxH>0&&workedH>=maxH-0.1)return;
+          const periodsP=sh.type==='split'?[[t2m(sh.ms),t2m(sh.me)],[t2m(sh.as),t2m(sh.ae)]]:[[t2m(sh.ms),t2m(sh.ae)]];
+          for(const [pS,pE] of periodsP){
+            if(maxH>0&&workedH>=maxH-0.1)break;
+            // periodo già (parzialmente) coperto dalla preferenza? salta
+            const covered=sch.days[dayKey].shifts.some(s=>s.employeeId===empId&&t2m(s.startTime)<pE&&t2m(s.endTime)>pS);
+            if(covered)continue;
+            const remainingP=maxH>0?maxH-workedH:8;
+            if(remainingP<=0.1)continue;
+            const periodLenH=(pE-pS)/60;
+            const durH=Math.min(remainingP,periodLenH,6); // rispetta max 6h consecutive
+            const endMp=pS+Math.round(durH*60);
+            const actualHp=shiftH(m2t(pS),m2t(endMp));
+            if(actualHp<MIN_SHIFT_M/60)continue;
+            const areaCountP={};S.areas.forEach(a=>{areaCountP[a.id]=sch.days[dayKey].shifts.filter(s=>s.areaId===a.id).length});
+            let areaIdP='';
+            if(emp.isProfumeria){const pA=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));if(pA)areaIdP=pA.id}
+            if(!areaIdP){const unc=S.areas.find(a=>!areaCountP[a.id]);areaIdP=unc?unc.id:(S.areas[0]||{id:''}).id}
+            const isOTp=maxH>0&&(workedH+actualHp)>maxH;
+            sch.days[dayKey].shifts.push({employeeId:empId,startTime:m2t(pS),endTime:m2t(endMp),areaId:areaIdP,hours:actualHp,overtime:isOTp||undefined});
+            workedH+=actualHp;
+          }
           return;
         }
         const remaining=maxH>0?maxH-workedH:8;
