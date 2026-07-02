@@ -182,6 +182,18 @@ textarea.form-control{resize:vertical;min-height:64px}
 /* ── STRAORDINARI BADGE ── */
 .shift-chip.overtime{border-left-color:#E67E22;background:#FEF0E0}
 .badge-ot{background:#FDEBD0;color:#784212;font-size:10px;font-weight:700;padding:1px 5px;border-radius:8px;display:inline-block;margin-top:2px}
+/* ── CHECK ORARI: TAB + COPERTURA AREE ── */
+.co-tab-btn{background:#fff;border:1px solid var(--border);border-radius:6px;padding:7px 14px;cursor:pointer;font-size:12px;font-weight:700;color:var(--muted);transition:all 120ms}
+.co-tab-btn:hover{border-color:var(--accent);color:var(--accent)}
+.co-tab-btn.active{background:var(--primary);border-color:var(--primary);color:#fff}
+.cov-bar{display:flex;height:20px;border-radius:3px;overflow:hidden;border:1px solid var(--border);margin:3px 0}
+.cov-seg-ok{background:#27AE60}
+.cov-seg-gap{background:repeating-linear-gradient(45deg,#E74C3C,#E74C3C 5px,#C0392B 5px,#C0392B 10px);cursor:pointer}
+.cov-times{display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:1px}
+.gap-chip{display:inline-flex;align-items:center;gap:5px;background:#FDEDEC;border:1px solid #F5B7B1;color:#922B21;font-size:11px;font-weight:600;padding:3px 8px;border-radius:12px;margin:2px 4px 2px 0;cursor:pointer}
+.gap-chip:hover{background:#FADBD8}
+.day-highlight{outline:3px solid #E67E22 !important;outline-offset:-2px;animation:dayPulse 1.4s ease-in-out 0s 2}
+@keyframes dayPulse{0%,100%{background-color:transparent}50%{background-color:#FEF0E0}}
 </style>
 </head>
 <body>
@@ -1954,6 +1966,71 @@ function showGenPreview(weekIdx){
 // Calcola, per la settimana attualmente visualizzata, le ore effettive di ogni
 // dipendente confrontandole con il contratto: ore usate, straordinari, carenze.
 // Riflette eventuali modifiche manuali fatte sull'orario settimanale.
+// Calcola, per ogni giorno aperto e per ogni area, le fasce orarie NON coperte da
+// alcun turno (di qualsiasi dipendente, inclusi straordinari/copertura direttore/domenica)
+// durante l'orario di apertura del negozio di quel giorno.
+function computeAreaCoverageGaps(sch){
+  const result=[];
+  DAYS_KEY.forEach((dayKey,dayIdx)=>{
+    const sh=S.storeHours[dayKey];
+    if(!sh||!sh.open)return; // giorno chiuso: nessuna copertura richiesta
+    const periods=sh.type==='split'?[[t2m(sh.ms),t2m(sh.me)],[t2m(sh.as),t2m(sh.ae)]]:[[t2m(sh.ms),t2m(sh.ae)]];
+    const dayData=sch.days[dayKey];
+    const dayShifts=(dayData&&dayData.shifts)||[];
+    S.areas.forEach(area=>{
+      // Intervalli coperti da QUALSIASI turno assegnato a quest'area, quel giorno
+      const raw=dayShifts.filter(s=>s.areaId===area.id).map(s=>[t2m(s.startTime),t2m(s.endTime)]).sort((a,b)=>a[0]-b[0]);
+      const merged=[];
+      raw.forEach(([s,e])=>{
+        if(merged.length&&s<=merged[merged.length-1][1]){
+          merged[merged.length-1][1]=Math.max(merged[merged.length-1][1],e);
+        } else merged.push([s,e]);
+      });
+      const periodsOut=periods.map(([pS,pE])=>{
+        if(pE<=pS)return {pS,pE,segments:[],gaps:[]};
+        const segments=[];
+        let cursor=pS;
+        merged.forEach(([ms,me])=>{
+          if(me<=pS||ms>=pE)return;
+          const s=Math.max(ms,pS), e=Math.min(me,pE);
+          if(s>cursor)segments.push({s:cursor,e:s,covered:false});
+          if(e>s)segments.push({s,e,covered:true});
+          cursor=Math.max(cursor,e);
+        });
+        if(cursor<pE)segments.push({s:cursor,e:pE,covered:false});
+        const gaps=segments.filter(x=>!x.covered&&x.e>x.s);
+        return {pS,pE,segments,gaps};
+      });
+      const totalGapMin=periodsOut.reduce((s,p)=>s+p.gaps.reduce((s2,g)=>s2+(g.e-g.s),0),0);
+      result.push({dayKey,dayIdx,area,periods:periodsOut,totalGapMin});
+    });
+  });
+  return result;
+}
+
+// Chiude il modal, salta alla colonna del giorno indicato nell'orario e la evidenzia
+// per qualche secondo — permette di intervenire subito su una fascia scoperta.
+function jumpToDay(dayKey){
+  closeModal();
+  setTimeout(()=>{
+    const cells=document.querySelectorAll(`[data-day="${dayKey}"]`);
+    if(!cells.length)return;
+    cells[0].scrollIntoView({behavior:'smooth',block:'center',inline:'center'});
+    cells.forEach(el=>{
+      el.classList.add('day-highlight');
+      setTimeout(()=>el.classList.remove('day-highlight'),2800);
+    });
+  },80);
+}
+function switchCheckOrariTab(tab){
+  const h=document.getElementById('coTabHours'),c=document.getElementById('coTabCoverage');
+  const bh=document.getElementById('coBtnHours'),bc=document.getElementById('coBtnCoverage');
+  if(h)h.style.display=tab==='hours'?'':'none';
+  if(c)c.style.display=tab==='coverage'?'':'none';
+  if(bh)bh.classList.toggle('active',tab==='hours');
+  if(bc)bc.classList.toggle('active',tab==='coverage');
+}
+
 function openCheckOrari(){
   if(!S.weekSchedules.length){toast('Nessun orario generato');return}
   if(S.currentViewSource!=='current'){toast('Disponibile solo sull\'orario corrente');return}
@@ -2022,28 +2099,96 @@ function openCheckOrari(){
   const totalDeficit=rows.reduce((s,r)=>{const cmp=r.effectiveContract>0?r.effectiveContract:r.contract;return s+(!r.isVacation&&cmp>0&&r.totH<cmp?(cmp-r.totH):0)},0);
   const totalWorked=rows.reduce((s,r)=>s+r.totH,0);
 
+  // ── PROSPETTO 2: COPERTURA AREE ──
+  const coverage=computeAreaCoverageGaps(sch);
+  const flatGaps=[];
+  coverage.forEach(c=>{c.periods.forEach(p=>{p.gaps.forEach(g=>{flatGaps.push({dayKey:c.dayKey,dayIdx:c.dayIdx,area:c.area,s:g.s,e:g.e})})})});
+  flatGaps.sort((a,b)=>a.dayIdx-b.dayIdx||a.s-b.s);
+  const totalGapH=Math.round(flatGaps.reduce((s,g)=>s+(g.e-g.s),0)/6)/10;
+
+  const quickListHtml=flatGaps.length?flatGaps.map(g=>
+    `<span class="gap-chip" onclick="jumpToDay('${g.dayKey}')">⚠️ ${DAYS_FULL[g.dayIdx]} ${fmtShort(addDays(ws,g.dayIdx))} · ${esc(g.area.name)} · ${m2t(g.s)}–${m2t(g.e)} <span style="opacity:.75">🔧 vai</span></span>`
+  ).join(''):`<div class="alert" style="background:#EAFAF1;border-color:#A9DFBF;color:#1E8449;font-weight:600">✓ Nessuna fascia scoperta questa settimana — tutte le aree sono coperte durante l'orario di apertura.</div>`;
+
+  const dayCardsHtml=DAYS_KEY.map((dayKey,dayIdx)=>{
+    const sh0=S.storeHours[dayKey];
+    if(!sh0||!sh0.open)return '';
+    const dayAreas=coverage.filter(c=>c.dayKey===dayKey);
+    const dayHasGaps=dayAreas.some(c=>c.totalGapMin>0);
+    const areaRows=dayAreas.map(c=>{
+      const barsHtml=c.periods.map(p=>{
+        const totalLen=p.pE-p.pS;
+        if(totalLen<=0)return '';
+        const segHtml=p.segments.map(seg=>{
+          const w=((seg.e-seg.s)/totalLen*100).toFixed(2);
+          const cls=seg.covered?'cov-seg-ok':'cov-seg-gap';
+          const clickAttr=seg.covered?'':` onclick="jumpToDay('${dayKey}')"`;
+          return `<div class="${cls}" style="width:${w}%" title="${m2t(seg.s)}–${m2t(seg.e)} ${seg.covered?'coperta':'SCOPERTA — clicca per intervenire'}"${clickAttr}></div>`;
+        }).join('');
+        return `<div><div class="cov-bar">${segHtml}</div><div class="cov-times"><span>${m2t(p.pS)}</span><span>${m2t(p.pE)}</span></div></div>`;
+      }).join('');
+      const gapList=c.periods.flatMap(p=>p.gaps).map(g=>`<span class="gap-chip" onclick="jumpToDay('${dayKey}')">${m2t(g.s)}–${m2t(g.e)} 🔧</span>`).join('');
+      return `<tr>
+        <td style="white-space:nowrap;vertical-align:top;padding-top:8px"><span style="width:10px;height:10px;background:${c.area.color};border-radius:2px;display:inline-block;margin-right:5px"></span>${esc(c.area.name)}</td>
+        <td style="min-width:220px">${barsHtml}</td>
+        <td style="min-width:130px;vertical-align:top;padding-top:6px">${gapList||'<span style="color:#1E8449;font-size:11px">✓ coperta</span>'}</td>
+      </tr>`;
+    }).join('');
+    return `<div style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <div style="background:${dayHasGaps?'#FDEDEC':'#EAFAF1'};padding:8px 12px;font-weight:700;font-size:13px;display:flex;justify-content:space-between;align-items:center">
+        <span>${DAYS_FULL[dayIdx]} ${fmtShort(addDays(ws,dayIdx))}</span>
+        ${dayHasGaps?'<span style="font-size:11px;color:#C0392B">⚠️ fasce scoperte</span>':'<span style="font-size:11px;color:#1E8449">✓ tutto coperto</span>'}
+      </div>
+      <table style="width:100%;border-collapse:collapse"><tbody>${areaRows}</tbody></table>
+    </div>`;
+  }).join('');
+
   openModal(`
     <div class="modal-header"><div class="modal-title">📊 Check Orari — Sett. ${idx+1} (${weekRange(sch.weekStart)})</div><button class="modal-close" onclick="closeModal()">×</button></div>
     <div class="modal-body">
-      <div class="alert alert-info" style="margin-bottom:14px">Calcolo basato sull'orario attuale, incluse le modifiche manuali. Le ore sono la somma effettiva dei turni assegnati questa settimana.</div>
-      <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
-        <div style="flex:1;min-width:120px;background:#F4F6F7;border-radius:6px;padding:10px;text-align:center">
-          <div style="font-size:20px;font-weight:700;color:var(--primary)">${Math.round(totalWorked*10)/10}h</div>
-          <div style="font-size:11px;color:var(--muted)">Ore totali assegnate</div>
-        </div>
-        <div style="flex:1;min-width:120px;background:#FEF0E0;border-radius:6px;padding:10px;text-align:center">
-          <div style="font-size:20px;font-weight:700;color:#E67E22">${Math.round(totalOT*10)/10}h</div>
-          <div style="font-size:11px;color:var(--muted)">Straordinari totali</div>
-        </div>
-        <div style="flex:1;min-width:120px;background:#FDEDEC;border-radius:6px;padding:10px;text-align:center">
-          <div style="font-size:20px;font-weight:700;color:#C0392B">${Math.round(totalDeficit*10)/10}h</div>
-          <div style="font-size:11px;color:var(--muted)">Carenze totali</div>
-        </div>
+      <div style="display:flex;gap:8px;margin-bottom:14px">
+        <button class="co-tab-btn active" id="coBtnHours" onclick="switchCheckOrariTab('hours')">👥 Ore Dipendenti</button>
+        <button class="co-tab-btn" id="coBtnCoverage" onclick="switchCheckOrariTab('coverage')">🗺️ Copertura Aree${flatGaps.length?` <span style="background:#E74C3C;color:#fff;border-radius:8px;padding:0 6px;font-size:10px;margin-left:2px">${flatGaps.length}</span>`:''}</button>
       </div>
-      <table>
-        <thead><tr><th>Dipendente</th><th>Contratto</th><th>Ore Assegnate</th><th>Stato</th><th>Note</th></tr></thead>
-        <tbody>${tableRows}</tbody>
-      </table>
+
+      <div id="coTabHours">
+        <div class="alert alert-info" style="margin-bottom:14px">Calcolo basato sull'orario attuale, incluse le modifiche manuali. Le ore sono la somma effettiva dei turni assegnati questa settimana.</div>
+        <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+          <div style="flex:1;min-width:120px;background:#F4F6F7;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:20px;font-weight:700;color:var(--primary)">${Math.round(totalWorked*10)/10}h</div>
+            <div style="font-size:11px;color:var(--muted)">Ore totali assegnate</div>
+          </div>
+          <div style="flex:1;min-width:120px;background:#FEF0E0;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:20px;font-weight:700;color:#E67E22">${Math.round(totalOT*10)/10}h</div>
+            <div style="font-size:11px;color:var(--muted)">Straordinari totali</div>
+          </div>
+          <div style="flex:1;min-width:120px;background:#FDEDEC;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:20px;font-weight:700;color:#C0392B">${Math.round(totalDeficit*10)/10}h</div>
+            <div style="font-size:11px;color:var(--muted)">Carenze totali</div>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Dipendente</th><th>Contratto</th><th>Ore Assegnate</th><th>Stato</th><th>Note</th></tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>
+
+      <div id="coTabCoverage" style="display:none">
+        <div class="alert alert-info" style="margin-bottom:14px">Fasce orarie in cui nessun dipendente risulta assegnato a un'area, durante l'orario di apertura del negozio. Clicca su una fascia scoperta (barra rossa tratteggiata o etichetta 🔧) per saltare direttamente a quel giorno nell'orario e correggerlo.</div>
+        <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+          <div style="flex:1;min-width:120px;background:${flatGaps.length?'#FDEDEC':'#EAFAF1'};border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:20px;font-weight:700;color:${flatGaps.length?'#C0392B':'#1E8449'}">${totalGapH}h</div>
+            <div style="font-size:11px;color:var(--muted)">Ore scoperte totali</div>
+          </div>
+          <div style="flex:1;min-width:120px;background:#F4F6F7;border-radius:6px;padding:10px;text-align:center">
+            <div style="font-size:20px;font-weight:700;color:var(--primary)">${flatGaps.length}</div>
+            <div style="font-size:11px;color:var(--muted)">Fasce scoperte</div>
+          </div>
+        </div>
+        <div style="margin-bottom:16px">${quickListHtml}</div>
+        <div class="divider" style="margin-bottom:14px"></div>
+        ${dayCardsHtml}
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-primary" onclick="closeModal()">Chiudi</button>
@@ -2128,7 +2273,7 @@ function renderSchedule(){
 
   DAYS_KEY.forEach((key,i)=>{
     const sh=S.storeHours[key];const closed=!sh||!sh.open;
-    html+=`<th style="${closed?'opacity:.45':''}"><div>${DAYS_SHORT[i]}</div><div style="font-size:10px;font-weight:400">${fmtShort(addDays(ws,i))}</div>${closed?'<div style="font-size:9px">CHIUSO</div>':''}</th>`;
+    html+=`<th data-day="${key}" style="${closed?'opacity:.45':''}"><div>${DAYS_SHORT[i]}</div><div style="font-size:10px;font-weight:400">${fmtShort(addDays(ws,i))}</div>${closed?'<div style="font-size:9px">CHIUSO</div>':''}</th>`;
   });
   html+=`</tr></thead><tbody>`;
 
@@ -2146,8 +2291,8 @@ function renderSchedule(){
       const dayData=sch.days[key];
       const onVacDay=isOnVacationDay(emp,dayDate); // ferie QUEL giorno
 
-      if(closed){html+=`<td><div class="day-cell is-closed"><span style="font-size:10px;color:#ADB5BD">Chiuso</span></div></td>`;return}
-      if(!dayData){html+=`<td><div class="day-cell"></div></td>`;return}
+      if(closed){html+=`<td data-day="${key}"><div class="day-cell is-closed"><span style="font-size:10px;color:#ADB5BD">Chiuso</span></div></td>`;return}
+      if(!dayData){html+=`<td data-day="${key}"><div class="day-cell"></div></td>`;return}
 
       const isOff=dayData.dayOff&&dayData.dayOff.includes(emp.id);
       const isAbs=(emp.daysOff||[]).includes(dayDate);
@@ -2158,13 +2303,13 @@ function renderSchedule(){
       const cursor=isReadOnly?'cursor:default':'';
 
       // Ferie: cliccabile per correzione manuale (mostra turni se ce ne sono dopo modifica manuale)
-      if(onVacDay&&!shifts.length){html+=`<td><div class="day-cell is-vacation" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#922B21">FERIE</span></div></td>`;return}
-      if(isAbs&&!shifts.length){html+=`<td><div class="day-cell is-absence" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#721C24">Assenza</span></div></td>`;return}
-      if(isPerm&&!shifts.length){html+=`<td><div class="day-cell is-perm" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#0C5460">Permesso</span></div></td>`;return}
-      if(isOff&&!shifts.length){html+=`<td><div class="day-cell is-dayoff" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#856404">Riposo</span></div></td>`;return}
+      if(onVacDay&&!shifts.length){html+=`<td data-day="${key}"><div class="day-cell is-vacation" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#922B21">FERIE</span></div></td>`;return}
+      if(isAbs&&!shifts.length){html+=`<td data-day="${key}"><div class="day-cell is-absence" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#721C24">Assenza</span></div></td>`;return}
+      if(isPerm&&!shifts.length){html+=`<td data-day="${key}"><div class="day-cell is-perm" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#0C5460">Permesso</span></div></td>`;return}
+      if(isOff&&!shifts.length){html+=`<td data-day="${key}"><div class="day-cell is-dayoff" ${clickFn} style="${cursor}"><span class="cell-lbl" style="color:#856404">Riposo</span></div></td>`;return}
 
       if(!shifts.length){
-        html+=`<td><div class="day-cell" ${clickFn} style="${cursor}">${isReadOnly?'':' <div class="add-shift">+ Aggiungi</div>'}</div></td>`;
+        html+=`<td data-day="${key}"><div class="day-cell" ${clickFn} style="${cursor}">${isReadOnly?'':' <div class="add-shift">+ Aggiungi</div>'}</div></td>`;
         return;
       }
 
@@ -2177,7 +2322,7 @@ function renderSchedule(){
         return `<div class="shift-chip ${s.overtime?'overtime':''}" style="border-left-color:${color}"><div class="shift-time">${s.startTime}–${s.endTime}</div><div class="shift-area">${area?esc(area.name):'—'}</div>${otBadge}${sunBadge}${gapBadge}${prefBadge}</div>`;
       }).join('');
 
-      html+=`<td><div class="day-cell" ${clickFn} style="${cursor}" ${!isReadOnly?'title="Clicca per modificare"':''}>${shiftsHtml}</div></td>`;
+      html+=`<td data-day="${key}"><div class="day-cell" ${clickFn} style="${cursor}" ${!isReadOnly?'title="Clicca per modificare"':''}>${shiftsHtml}</div></td>`;
     });
     html+=`</tr>`;
   });
