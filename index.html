@@ -344,8 +344,10 @@ textarea.form-control{resize:vertical;min-height:64px}
       <div class="info-box mb-16">
         <strong>Regole applicate automaticamente:</strong>
         <ul style="margin-top:6px;padding-left:18px;line-height:1.9;font-size:12px">
-          <li><strong>Priorità 1 — Copertura settimana completa</strong> (inclusa domenica) per tutti i giorni di apertura</li>
-          <li><strong>Priorità 2 — Contemporaneità per area</strong>: Magazzino-Vendita è sacrificabile in caso di carenza personale</li>
+          <li><strong>Priorità 1 — Profumeria su TUTTI i giorni</strong>: prima si mettono a copertura di ogni giornata di apertura le esperte di profumeria, poi si completa la copertura con gli altri dipendenti</li>
+          <li><strong>Priorità 2 — Copertura settimana completa</strong> (inclusa domenica) per tutti i giorni di apertura</li>
+          <li><strong>Turni variati</strong>: nessuno fa tutte mattine o tutti pomeriggi — mattina e pomeriggio si alternano tra i dipendenti giorno per giorno</li>
+          <li><strong>Priorità 3 — Contemporaneità per area</strong>: Magazzino-Vendita è sacrificabile in caso di carenza personale</li>
           <li><strong>Domenica: esattamente 3 persone</strong>, turno completo (apertura→chiusura), a rotazione settimanale — non sempre le stesse 3</li>
           <li>Chi inizia alle 07:00 (camion) deve fare <strong>almeno fino alle 11:00</strong> (min. 4h)</li>
           <li>Turno minimo: <strong>2 ore</strong> — nessun turno inferiore viene assegnato</li>
@@ -1072,8 +1074,18 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       return sunCandidates.indexOf(a)-sunCandidates.indexOf(b);
     });
 
-    // Prendi i primi flexNeeded
-    const chosen=sorted.slice(0,Math.min(flexNeeded,sorted.length));
+    // Prendi i primi flexNeeded — ma garantendo almeno un'esperta profumeria
+    // (priorità profumeria: tutti i giorni di apertura, domenica inclusa)
+    const chosen=[];
+    const profSunAlready=fixedSunWorkers.some(e=>e.isProfumeria);
+    if(!profSunAlready){
+      const profSun=sorted.find(e=>e.isProfumeria);
+      if(profSun&&flexNeeded>0)chosen.push(profSun);
+    }
+    for(const e of sorted){
+      if(chosen.length>=flexNeeded)break;
+      if(!chosen.includes(e))chosen.push(e);
+    }
     chosen.forEach(e=>sunWorkerIds.add(e.id));
 
     // Tutti i flex non scelti → dayOff domenica
@@ -1092,6 +1104,10 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     DAYS_KEY.forEach(k=>{if(sch.days[k].dayOff.includes(e.id)&&S.storeHours[k]&&S.storeHours[k].open)restCount[k]=(restCount[k]||0)+1});
   });
   const restPref=['mon','tue','wed','thu','fri','sat','sun'];
+  // Quante esperte profumeria riposano già in ciascun giorno: serve a distribuire
+  // i loro riposi (priorità: ogni giorno di apertura deve avere una profumeria).
+  const profRestCount={};
+  openDays.forEach(d=>{profRestCount[d]=avail.filter(e=>e.isProfumeria&&sch.days[d].dayOff.includes(e.id)).length});
   flexEmps.forEach(emp=>{
     const lastRest=restHistory[emp.id];
     let chosen;
@@ -1118,8 +1134,12 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
         pool=pool.filter(d=>d!==prefWD);
       }
       const sorted2=[...pool].sort((a,b)=>{
-        const penA=(a===lastRest?100:0)+(restCount[a]||0);
-        const penB=(b===lastRest?100:0)+(restCount[b]||0);
+        // penalità extra per le esperte profumeria: evita che due esperte riposino
+        // lo stesso giorno, così ogni giornata resta coperta dalla profumeria
+        const profA=emp.isProfumeria?(profRestCount[a]||0)*50:0;
+        const profB=emp.isProfumeria?(profRestCount[b]||0)*50:0;
+        const penA=(a===lastRest?100:0)+(restCount[a]||0)+profA;
+        const penB=(b===lastRest?100:0)+(restCount[b]||0)+profB;
         if(penA!==penB)return penA-penB;
         return restPref.indexOf(a)-restPref.indexOf(b);
       });
@@ -1128,6 +1148,7 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     if(chosen&&!sch.days[chosen].dayOff.includes(emp.id)){
       sch.days[chosen].dayOff.push(emp.id);
       restCount[chosen]=(restCount[chosen]||0)+1;
+      if(emp.isProfumeria)profRestCount[chosen]=(profRestCount[chosen]||0)+1;
     }
   });
 
@@ -1143,6 +1164,64 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       ref=t2m(s.startTime);
     }
     return mins/60;
+  };
+
+  // ── HELPER: ALTERNANZA MATTINA / POMERIGGIO ──
+  // Regola: nessuno deve fare sempre lo stesso turno (tutte mattine o tutti pomeriggi).
+  // Si tiene traccia, per ogni dipendente, di quante mattine e quanti pomeriggi ha già
+  // fatto nella settimana e di quale turno ha fatto il giorno precedente; il punteggio
+  // che ne deriva ordina i candidati nelle fasi di copertura e riempimento.
+
+  // Classifica un turno come 'morning' o 'afternoon' in base a dove cade la maggior parte
+  const slotOf=(dk,startT,endT)=>{
+    const shd=S.storeHours[dk];
+    if(!shd)return 'morning';
+    const s=t2m(startT),e=t2m(endT);
+    const mid=shd.type==='split'
+      ? Math.round((t2m(shd.me)+t2m(shd.as))/2)
+      : t2m(shd.ms)+Math.round((t2m(shd.ae)-t2m(shd.ms))/2);
+    const mornMin=Math.max(0,Math.min(e,mid)-s);
+    const aftMin =Math.max(0,e-Math.max(s,mid));
+    return aftMin>mornMin?'afternoon':'morning';
+  };
+
+  // Statistiche mattine/pomeriggi sui giorni PRECEDENTI a uptoIdx (esclusivo)
+  const computeSlotStats=(uptoIdx)=>{
+    const st={};
+    avail.forEach(e=>{st[e.id]={morning:0,afternoon:0,last:null,lastDayIdx:-5}});
+    DAYS_KEY.forEach((dk,idx)=>{
+      if(idx>=uptoIdx)return;
+      if(!sch.days[dk])return;
+      const perEmp={};
+      sch.days[dk].shifts.forEach(s=>{
+        const sl=slotOf(dk,s.startTime,s.endTime);
+        if(!perEmp[s.employeeId])perEmp[s.employeeId]={};
+        perEmp[s.employeeId][sl]=true;
+      });
+      Object.keys(perEmp).forEach(eid=>{
+        if(!st[eid])st[eid]={morning:0,afternoon:0,last:null,lastDayIdx:-5};
+        const sls=Object.keys(perEmp[eid]);
+        sls.forEach(sl=>{st[eid][sl]++});
+        st[eid].last=sls.length===1?sls[0]:'both';
+        st[eid].lastDayIdx=idx;
+      });
+    });
+    return st;
+  };
+
+  // Punteggio di penalità: più alto = meno adatto a fare QUEL turno oggi
+  const slotScore=(st,emp,slot,dayIdx)=>{
+    const s=st[emp.id];
+    if(!s)return 0;
+    const other=slot==='morning'?'afternoon':'morning';
+    let p=0;
+    // Penalizza SOLO lo squilibrio (non il volume di ore): chi fa già più mattine che
+    // pomeriggi — o viceversa — passa in coda quando si assegna il turno più frequente.
+    const diff=s[slot]-s[other];
+    if(diff>0)p+=diff*2;
+    // Chi ieri ha fatto SOLO questo turno (non giornata intera) oggi cambia
+    if(s.last===slot&&s.lastDayIdx===dayIdx-1)p+=3;
+    return p;
   };
 
   // ── PASSO 1: calcola deficit orario totale della settimana ──
@@ -1173,6 +1252,87 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
 
   if(!S.areas.length){
     warnings.push(`⚠️ Nessuna area configurata — i turni vengono assegnati senza area. Configura le aree prima di generare.`);
+  }
+
+  // ── PASSO 1-bis: PRIORITÀ PROFUMERIA — PRIMA si coprono TUTTI i giorni ──
+  // Regola richiesta: per prima cosa si mettono a copertura di ogni giornata di apertura
+  // le dipendenti esperte di profumeria; solo dopo l'algoritmo completa il resto della
+  // copertura con gli altri dipendenti. Per ogni giorno si pre-assegna un turno (mattina
+  // o pomeriggio, alternando) a un'esperta ancora disponibile, riservandole una quota di
+  // ore così che il monte ore non si esaurisca sui primi giorni della settimana.
+  const profAreaMain=S.areas.find(a=>a.name.toLowerCase().includes('profumeria'));
+  const profEmps=flexEmps.filter(e=>e.isProfumeria);
+  if(profEmps.length){
+    const profDays=openDays.filter(d=>d!=='sun'); // domenica gestita a parte (3 persone)
+    profDays.forEach(dayKey=>{
+      const dIdx=DAYS_KEY.indexOf(dayKey);
+      const shd=S.storeHours[dayKey];
+      if(!shd||!shd.open)return;
+      const dDate=isoDate(addDays(weekStart,dIdx));
+
+      // Giorno già coperto da un'esperta (turno fisso o preferenza)? Nulla da fare.
+      const already=sch.days[dayKey].shifts.some(s=>{const e=getEmp(s.employeeId);return e&&e.isProfumeria});
+      if(already)return;
+
+      const cands=profEmps.filter(emp=>{
+        if(sch.days[dayKey].dayOff.includes(emp.id))return false;
+        if((emp.daysOff||[]).includes(dDate))return false;
+        if((emp.permissionDays||[]).includes(dDate))return false;
+        if(isOnVacationDay(emp,dDate))return false;
+        const maxH=empMaxH(emp);
+        return maxH<=0||(worked[emp.id]||0)<maxH-MIN_SHIFT_M/60;
+      });
+      // Nessuna esperta disponibile/collocabile: la giornata verrà coperta dagli altri
+      // dipendenti e segnalata dall'avviso finale di copertura profumeria.
+      if(!cands.length)return;
+
+      // Periodi mattina/pomeriggio del giorno
+      const periods=shd.type==='split'
+        ? [['morning',t2m(shd.ms),t2m(shd.me)],['afternoon',t2m(shd.as),t2m(shd.ae)]]
+        : (()=>{const o=t2m(shd.ms),c=t2m(shd.ae),mid=o+Math.round((c-o)/2);
+                return [['morning',o,mid],['afternoon',mid,c]]})();
+
+      const stats=computeSlotStats(dIdx);
+      let best=null;
+      cands.forEach(emp=>{
+        const maxH=empMaxH(emp);
+        const residual=maxH>0?maxH-(worked[emp.id]||0):9;
+        // giorni residui (oggi incluso) in cui questa esperta può lavorare → quota giornaliera
+        let remDays=0;
+        profDays.forEach(dk=>{
+          const i=DAYS_KEY.indexOf(dk);
+          if(i<dIdx)return;
+          if(sch.days[dk].dayOff.includes(emp.id))return;
+          const dd=isoDate(addDays(weekStart,i));
+          if((emp.daysOff||[]).includes(dd)||(emp.permissionDays||[]).includes(dd)||isOnVacationDay(emp,dd))return;
+          remDays++;
+        });
+        const quotaM=Math.max(MIN_SHIFT_M,Math.round(residual/Math.max(1,remDays)*60));
+        periods.forEach(([slot,pS,pE])=>{
+          // già in turno in quel periodo?
+          if(sch.days[dayKey].shifts.some(s=>s.employeeId===emp.id&&t2m(s.startTime)<pE&&t2m(s.endTime)>pS))return;
+          if(S.maxConcurrentTotal){
+            const conc=sch.days[dayKey].shifts.filter(x=>t2m(x.startTime)<=pS&&t2m(x.endTime)>pS).length;
+            if(conc>=S.maxConcurrentTotal)return;
+          }
+          const durM=Math.min(pE-pS,6*60,Math.round(residual*60),quotaM);
+          if(durM<MIN_SHIFT_M)return;
+          // punteggio: penalità alternanza, a parità premia chi ha più ore residue
+          const sc=slotScore(stats,emp,slot,dIdx)-residual*0.3;
+          if(!best||sc<best.sc)best={emp,slot,pS,durM,sc};
+        });
+      });
+
+      if(!best)return;
+      const endM=best.pS+best.durM;
+      const aId=(profAreaMain&&profAreaMain.id)||((nonMagAreas[0]||S.areas[0]||{id:''}).id);
+      const h=shiftH(m2t(best.pS),m2t(endM));
+      sch.days[dayKey].shifts.push({
+        employeeId:best.emp.id,startTime:m2t(best.pS),endTime:m2t(endM),
+        areaId:aId,hours:h,profPriority:true
+      });
+      worked[best.emp.id]=(worked[best.emp.id]||0)+h;
+    });
   }
 
   openDays.forEach(dayKey=>{
@@ -1347,6 +1507,9 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     const coverPeriod=(areaList,pStartT,pEndT)=>{
       const covered=new Set();
       const pEndM=t2m(pEndT);
+      // turno corrente (mattina/pomeriggio) e storico per l'alternanza
+      const curSlot=slotOf(dayKey,pStartT,pEndT);
+      const slotStats=computeSlotStats(dayIdx);
 
       areaList.forEach(area=>{
         const minReq=Math.max(1,area.minCoverage||1);
@@ -1390,7 +1553,11 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
             const profA=(isProfArea&&a.isProfumeria)?10:0;
             const profB=(isProfArea&&b.isProfumeria)?10:0;
             if(profA!==profB)return profB-profA;
-            return empBudget(b,cursor)-empBudget(a,cursor);
+            // Alternanza mattina/pomeriggio: chi ha già fatto molte volte questo turno
+            // (o l'ha fatto ieri) scende in coda; a parità vince chi ha più ore residue.
+            const scA=slotScore(slotStats,a,curSlot,dayIdx)-empBudget(a,cursor);
+            const scB=slotScore(slotStats,b,curSlot,dayIdx)-empBudget(b,cursor);
+            return scA-scB;
           });
 
           if(!cands.length){
@@ -1460,9 +1627,12 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     // Questo fillHours completa il contratto di ogni dipendente nel giorno corrente
     const fillHours=(pStartT,pEndT)=>{
       const pStartM=t2m(pStartT),pEndM=t2m(pEndT);
+      const curSlotF=slotOf(dayKey,pStartT,pEndT);
+      const slotStatsF=computeSlotStats(dayIdx);
       const sortedW=[...working].sort((a,b)=>{
-        const rA=empBudget(a,pStartM);
-        const rB=empBudget(b,pStartM);
+        // ore residue, corrette dalla penalità di alternanza mattina/pomeriggio
+        const rA=empBudget(a,pStartM)-slotScore(slotStatsF,a,curSlotF,dayIdx);
+        const rB=empBudget(b,pStartM)-slotScore(slotStatsF,b,curSlotF,dayIdx);
         return rB-rA;
       });
       sortedW.forEach(emp=>{
@@ -1654,7 +1824,17 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
     // E il rientro dopo una pausa di 2h da ogni turno esistente del dipendente (per negozi continuati)
     const startCandidates=sh2.type==='split'?[t2m(sh2.ms),t2m(sh2.as)]:[t2m(sh2.ms)];
     myDayShifts.forEach(s=>{const after=t2m(s.endTime)+120;if(after<dayClose&&!startCandidates.includes(after))startCandidates.push(after);});
-    startCandidates.sort((a,b)=>a-b);
+    // Alternanza: prova per primo lo slot (mattina/pomeriggio) che il dipendente ha
+    // fatto meno volte in settimana, così le ore residue non finiscono sempre nello
+    // stesso momento della giornata.
+    const statsSat=computeSlotStats(dayIdx2);
+    const slotAtStart=stM=>slotOf(dayKey,m2t(stM),m2t(Math.min(stM+MIN_SHIFT_M,dayClose)));
+    startCandidates.sort((a,b)=>{
+      const sa=slotScore(statsSat,emp,slotAtStart(a),dayIdx2);
+      const sb=slotScore(statsSat,emp,slotAtStart(b),dayIdx2);
+      if(Math.abs(sa-sb)>0.01)return sa-sb;
+      return a-b;
+    });
     for(const stM of startCandidates){
       if(myDayShifts.some(s=>stM<t2m(s.endTime)&&(stM+MIN_SHIFT_M)>t2m(s.startTime)))continue;
       if(myDayShifts.some(s=>t2m(s.endTime)<=stM&&stM-t2m(s.endTime)<120))continue;
@@ -1815,6 +1995,26 @@ function generateWeekSchedule(weekStartISO, warnings, restHistory={}, weekIndex=
       });
     });
   }
+
+  // ── Avviso copertura profumeria (priorità 1) ──
+  if(avail.some(e=>e.isProfumeria)){
+    openDays.forEach(dk=>{
+      const covered=sch.days[dk].shifts.some(s=>{const e=getEmp(s.employeeId);return e&&e.isProfumeria});
+      if(!covered){
+        warnings.push(`🌸 ${DAYS_FULL[DAYS_KEY.indexOf(dk)]} (${weekRange(weekStartISO)}): giornata SENZA esperta profumeria — verificare riposi/ferie.`);
+      }
+    });
+  }
+
+  // ── Avviso turni poco variati (mattine/pomeriggi) ──
+  flexEmps.forEach(e=>{
+    const st=computeSlotStats(7)[e.id];
+    if(!st)return;
+    const tot=st.morning+st.afternoon;
+    if(tot>=4&&(st.morning===0||st.afternoon===0)){
+      warnings.push(`🔁 ${e.name} (${weekRange(weekStartISO)}): sempre ${st.afternoon===0?'di mattina':'di pomeriggio'} (${tot} giorni) — variazione non possibile con i vincoli attuali.`);
+    }
+  });
 
   // ── Avvisi straordinari ──
   flexEmps.forEach(e=>{
